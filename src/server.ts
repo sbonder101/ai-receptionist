@@ -22,15 +22,22 @@ const BASE_URL = (process.env.BASE_URL || "").replace(/\/+$/, "");
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_VALIDATE_SIGNATURE = (process.env.TWILIO_VALIDATE_SIGNATURE || "false") === "true";
 
-const TTS_VOICE =
-  (process.env.TTS_VOICE as VoiceResponseSayAttributes["voice"]) || "alice";
+type TtsVoice = "alice"; // extend later if you add other supported values
+type TtsLang = "en-ZA" | "en-US"; // extend later if needed
 
-const TTS_LANG =
-  (process.env.TTS_LANG as VoiceResponseSayAttributes["language"]) || "en-ZA";
-
-if (!BASE_URL) {
-  logger.warn("BASE_URL is not set. TwiML callbacks may be wrong. Set BASE_URL in .env");
+function pickVoice(input: string | undefined): TtsVoice {
+  // For now keep it strict and stable
+  return input === "alice" ? "alice" : "alice";
 }
+
+function pickLang(input: string | undefined): TtsLang {
+  // Allow only known-good values; default to en-ZA
+  if (input === "en-US") return "en-US";
+  return "en-ZA";
+}
+
+const TTS_VOICE: TtsVoice = pickVoice(process.env.TTS_VOICE);
+const TTS_LANG: TtsLang = pickLang(process.env.TTS_LANG);
 
 app.set("trust proxy", 1);
 app.use(helmet());
@@ -112,8 +119,8 @@ function gatherSpeech(vr: twiml.VoiceResponse, actionUrl: string, prompt: string
     speechTimeout: "auto",
     action: actionUrl,
     method: "POST",
-    language: TTS_LANG as VoiceResponseGatherAttributes["language"],
-  } as VoiceResponseGatherAttributes);
+    language: TTS_LANG,
+  });
 
   gather.say({ voice: TTS_VOICE, language: TTS_LANG }, prompt);
 }
