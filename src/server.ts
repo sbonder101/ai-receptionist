@@ -1,4 +1,5 @@
-import express, { Request, Response, NextFunction } from "express";
+import express from "express";
+import type { Request, Response, NextFunction } from "express";
 import dotenv from "dotenv";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
@@ -6,10 +7,7 @@ import pinoHttp from "pino-http";
 import pino from "pino";
 import { v4 as uuidv4 } from "uuid";
 import { twiml } from "twilio";
-import type {
-  VoiceResponseSayAttributes,
-  VoiceResponseGatherAttributes
-} from "twilio/lib/twiml/VoiceResponse";
+
 import { validateRequest } from "twilio/lib/webhooks/webhooks";
 
 dotenv.config();
@@ -22,17 +20,15 @@ const BASE_URL = (process.env.BASE_URL || "").replace(/\/+$/, "");
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_VALIDATE_SIGNATURE = (process.env.TWILIO_VALIDATE_SIGNATURE || "false") === "true";
 
-type TtsVoice = "alice"; // extend later if you add other supported values
-type TtsLang = "en-ZA" | "en-US"; // extend later if needed
+type TtsVoice = "alice";
+type TtsLang = "en-ZA" | "en-US";
 
-function pickVoice(input: string | undefined): TtsVoice {
-  // For now keep it strict and stable
-  return input === "alice" ? "alice" : "alice";
+function pickVoice(v: string | undefined): TtsVoice {
+  return v === "alice" ? "alice" : "alice";
 }
 
-function pickLang(input: string | undefined): TtsLang {
-  // Allow only known-good values; default to en-ZA
-  if (input === "en-US") return "en-US";
+function pickLang(v: string | undefined): TtsLang {
+  if (v === "en-US") return "en-US";
   return "en-ZA";
 }
 
@@ -120,7 +116,7 @@ function gatherSpeech(vr: twiml.VoiceResponse, actionUrl: string, prompt: string
     action: actionUrl,
     method: "POST",
     language: TTS_LANG,
-  });
+  } as any);
 
   gather.say({ voice: TTS_VOICE, language: TTS_LANG }, prompt);
 }
