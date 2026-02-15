@@ -6,6 +6,10 @@ import pinoHttp from "pino-http";
 import pino from "pino";
 import { v4 as uuidv4 } from "uuid";
 import { twiml } from "twilio";
+import type {
+  VoiceResponseSayAttributes,
+  VoiceResponseGatherAttributes
+} from "twilio/lib/twiml/VoiceResponse";
 import { validateRequest } from "twilio/lib/webhooks/webhooks";
 
 dotenv.config();
@@ -18,8 +22,11 @@ const BASE_URL = (process.env.BASE_URL || "").replace(/\/+$/, "");
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_VALIDATE_SIGNATURE = (process.env.TWILIO_VALIDATE_SIGNATURE || "false") === "true";
 
-const TTS_VOICE = process.env.TTS_VOICE || "alice";
-const TTS_LANG = process.env.TTS_LANG || "en-ZA";
+const TTS_VOICE =
+  (process.env.TTS_VOICE as VoiceResponseSayAttributes["voice"]) || "alice";
+
+const TTS_LANG =
+  (process.env.TTS_LANG as VoiceResponseSayAttributes["language"]) || "en-ZA";
 
 if (!BASE_URL) {
   logger.warn("BASE_URL is not set. TwiML callbacks may be wrong. Set BASE_URL in .env");
@@ -105,8 +112,9 @@ function gatherSpeech(vr: twiml.VoiceResponse, actionUrl: string, prompt: string
     speechTimeout: "auto",
     action: actionUrl,
     method: "POST",
-    language: TTS_LANG,
-  });
+    language: TTS_LANG as VoiceResponseGatherAttributes["language"],
+  } as VoiceResponseGatherAttributes);
+
   gather.say({ voice: TTS_VOICE, language: TTS_LANG }, prompt);
 }
 
