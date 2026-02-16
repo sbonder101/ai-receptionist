@@ -247,7 +247,22 @@ app.post("/webhooks/twilio/inbound-call", (req: Request<{}, {}, TwilioVoiceBody>
   const vr = new twiml.VoiceResponse();
 
   // Greeting
-  say(vr, `Hi, you’ve reached ${tenant.businessName}. I’m the AI receptionist. How can I help you?`);
+  say(
+    vr,
+    `
+    <speak>
+      <prosody rate="95%" pitch="+1st">
+        Hi there.
+      </prosody>
+      <break time="400ms"/>
+      You’ve reached ${tenant.businessName}.
+      <break time="300ms"/>
+      I’m your virtual receptionist.
+      <break time="250ms"/>
+      How can I help you today?
+    </speak>
+    `
+  );
   // Gather initial speech
   const action = buildAbsoluteUrl(req, `/webhooks/twilio/handle-speech`);
   gatherSpeech(vr, action, "Please tell me what you need.");
