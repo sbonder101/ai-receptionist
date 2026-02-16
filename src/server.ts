@@ -29,7 +29,7 @@ const TWILIO_VALIDATE_SIGNATURE = (process.env.TWILIO_VALIDATE_SIGNATURE || "fal
 function getPublicUrl(req: Request): string {
   const proto = (req.header("x-forwarded-proto") || "https").split(",")[0].trim();
   const host = (req.header("x-forwarded-host") || req.header("host") || "").split(",")[0].trim();
-  return `${proto}://${host}${req.path}`;
+  return `${proto}://${host}${req.originalUrl}`; // includes ?query
 }
 
 
@@ -45,15 +45,15 @@ function normalizeBaseUrl(u: string): string {
 }
 
 type TtsVoice = "alice";
-type TtsLang = "en-ZA" | "en-US";
+type TtsLang = "en-US" | "en-GB";
 
 function pickVoice(v: string | undefined): TtsVoice {
   return v === "alice" ? "alice" : "alice";
 }
 
 function pickLang(v: string | undefined): TtsLang {
-  if (v === "en-US") return "en-US";
-  return "en-ZA";
+  if (v === "en-GB") return "en-GB";
+  return "en-US";
 }
 
 function loadKnowledgeBase(knowledgeBaseId: string) {
