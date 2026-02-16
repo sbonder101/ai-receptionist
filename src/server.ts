@@ -19,7 +19,7 @@ const app = express();
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
 const PORT = Number(process.env.PORT || 3000);
-const BASE_URL = (process.env.BASE_URL || "").replace(/\/+$/, "");
+const BASE_URL = normalizeBaseUrl(process.env.BASE_URL || process.env.PUBLIC_BASE_URL || "");
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_VALIDATE_SIGNATURE = (process.env.TWILIO_VALIDATE_SIGNATURE || "false") === "true";
 
@@ -33,6 +33,14 @@ function getPublicUrl(req: Request): string {
 }
 
 // end fix
+
+function normalizeBaseUrl(u: string): string {
+  const trimmed = (u || "").trim().replace(/\/+$/, "");
+  if (!trimmed) return "";
+  if (trimmed.startsWith("http://")) return "https://" + trimmed.slice("http://".length);
+  if (!trimmed.startsWith("http")) return "https://" + trimmed;
+  return trimmed;
+}
 
 type TtsVoice = "alice";
 type TtsLang = "en-ZA" | "en-US";
@@ -109,7 +117,7 @@ app.use(
 );
 
 function buildUrl(path: string): string {
-  if (!BASE_URL) return path; // fallback
+  if (!BASE_URL ) return path; // fallback
   return `${BASE_URL}${path.startsWith("/") ? "" : "/"}${path}`;
 }
 
