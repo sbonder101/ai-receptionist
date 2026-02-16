@@ -15,14 +15,16 @@
   {
     "id": "demo-sbo-tech",
     "businessName": "Sbo Tech Demo",
-    "twilioNumber": "+27870000000",
-    "timezone": "Africa/Johannesburg",
-    "hours": {
-      "mon_fri": "09:00-17:00",
-      "sat": "closed",
-      "sun": "closed"
-    },
+    "twilioNumber": "+27872500307",
     "handoffNumber": "+27789442230",
-    "knowledgeBaseId": "sbo_tech_demo"
+    "knowledgeBaseId": "kb_sbotech",
+    "hours": {
+      "1": { "open": "09:00", "close": "18:00" },
+      "2": { "open": "09:00", "close": "18:00" },
+      "3": { "open": "09:00", "close": "18:00" },
+      "4": { "open": "09:00", "close": "18:00" },
+      "5": { "open": "09:00", "close": "18:00" },
+      "6": { "open": "09:00", "close": "15:00" }
+    }
   }
 ]
