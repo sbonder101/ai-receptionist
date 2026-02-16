@@ -298,18 +298,28 @@ app.post("/webhooks/twilio/handle-speech", (req: Request<{}, {}, TwilioVoiceBody
   try {
     kb = loadKnowledgeBase(tenant.knowledgeBaseId);
   } catch (e) {
-    req.log.error({ e, tenantId: tenant.id }, "KB load failed");
-    say(vr, "Sorry, our system is having trouble right now. Please try again later.");
-    vr.hangup();
-    return res.type("text/xml").send(vr.toString());
+    // req.log.error({ e, tenantId: tenant.id }, "KB load failed");
+    // say(vr, "Sorry, our system is having trouble right now. Please try again later.");
+    // vr.hangup();
+    // return res.type("text/xml").send(vr.toString());
+
+    req.log.error({ err, knowledgeBaseId: tenant.knowledgeBaseId, tenantId }, "KB load failed");
+
   }
   
-  const answer = answerFromKB(kb, speech);
+  const answer = kb ? answerFromKB(kb, speech) : null;
 
   if (answer) {
     say(vr, answer);
   } else {
-    say(vr, "I can help with prices, hours, location, and bookings. What would you like to know?");
+    say(vr, "Sorry, I’m having trouble accessing the business info right now. Let me connect you to the owner.");
+    if (tenant.handoffNumber?.startsWith("+")) {
+      vr.dial(tenant.handoffNumber);
+      return res.type("text/xml").send(vr.toString());
+    }
+    say(vr, "Please call again later. Goodbye.");
+    vr.hangup();
+    return res.type("text/xml").send(vr.toString());
   }
 
 
