@@ -9,6 +9,9 @@ import { v4 as uuidv4 } from "uuid";
 import { twiml } from "twilio";
 
 import { validateRequest } from "twilio/lib/webhooks/webhooks";
+import tenants from "../data/tenants.json";
+import fs from "fs";
+import path from "path";
 
 dotenv.config();
 
@@ -32,11 +35,38 @@ function pickLang(v: string | undefined): TtsLang {
   return "en-ZA";
 }
 
+function loadKnowledgeBase(knowledgeBaseId: string) {
+  const file = path.join(process.cwd(), "data", `${knowledgeBaseId}.json`);
+  return JSON.parse(fs.readFileSync(file, "utf-8"));
+}
+
 const TTS_VOICE: TtsVoice = pickVoice(process.env.TTS_VOICE);
 const TTS_LANG: TtsLang = pickLang(process.env.TTS_LANG);
 
 app.set("trust proxy", 1);
 app.use(helmet());
+
+// tennat routing
+type Tenant = {
+  id: string;
+  businessName: string;
+  twilioNumber: string;
+  timezone: string;
+  hours: Record<string, string>;
+  handoffNumber: string;
+  knowledgeBaseId: string;
+};
+
+function resolveTenantByTwilioNumber(to?: string): Tenant {
+  const num = (to || "").replace(/\s+/g, "");
+  const tenant = (tenants as Tenant[]).find(t => t.twilioNumber === num);
+
+  if (!tenant) {
+    // fallback tenant
+    return (tenants as Tenant[]).find(t => t.id === "demo-sbo-tech")!;
+  }
+  return tenant;
+}
 
 // Twilio sends x-www-form-urlencoded
 app.use(express.urlencoded({ extended: false }));
@@ -121,6 +151,53 @@ function gatherSpeech(vr: twiml.VoiceResponse, actionUrl: string, prompt: string
   gather.say({ voice: TTS_VOICE, language: TTS_LANG }, prompt);
 }
 
+function twilioAuth(req: Request, res: Response, next: NextFunction) {
+  const signature = req.headers["x-twilio-signature"] as string;
+  const url = `${process.env.PUBLIC_BASE_URL}${req.originalUrl}`;
+
+  const isValid = validateRequest(
+    process.env.TWILIO_AUTH_TOKEN!,
+    signature,
+    url,
+    req.body
+  );
+
+  if (!isValid) {
+    return res.status(403).send("Forbidden");
+  }
+
+  next();
+}
+
+function answerFromKB(kb: any, utterance: string): string | null {
+  const u = utterance.toLowerCase();
+
+  if (/(price|cost|how much)/.test(u)) {
+    const list = kb.services.map((s: any) => `${s.name} is ${s.price} rand`).join(". ");
+    return list;
+  }
+
+  if (/(open|close|hours|time)/.test(u)) {
+    return kb.hours;
+  }
+
+  if (/(where|location|address)/.test(u)) {
+    return kb.address;
+  }
+
+  if (/(book|booking|appointment)/.test(u)) {
+    return kb.bookingRules + " I can take your name and preferred time.";
+  }
+
+  for (const faq of kb.faqs || []) {
+    if (u.includes(faq.q.toLowerCase().split(" ")[0])) {
+      return faq.a;
+    }
+  }
+
+  return null;
+}
+
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 /**
@@ -130,17 +207,19 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 app.post("/webhooks/twilio/inbound-call", (req: Request<{}, {}, TwilioVoiceBody>, res: Response) => {
   if (!twilioSignatureOk(req)) return res.status(403).send("Invalid Twilio signature");
 
-  const tenantId = resolveTenantId(req);
+  
   const callSid = req.body.CallSid || "unknown";
   const from = req.body.From || "unknown";
+  const to = req.body.To || req.body.Called;
+  const tenant = resolveTenantByTwilioNumber(to);
+  const tenantId = tenant.id;
 
   req.log.info({ tenantId, callSid, from }, "Inbound call received");
 
   const vr = new twiml.VoiceResponse();
 
   // Greeting
-  say(vr, "Hi, you’ve reached Sbo Tech. I’m the AI receptionist. How can I help you today?");
-
+  say(vr, `Hi, you’ve reached ${tenant.businessName}. I’m the AI receptionist. How can I help you?`);
   // Gather initial speech
   const action = buildUrl(`/webhooks/twilio/handle-speech?tenantId=${encodeURIComponent(tenantId)}`);
   gatherSpeech(vr, action, "Please tell me what you need.");
@@ -148,6 +227,7 @@ app.post("/webhooks/twilio/inbound-call", (req: Request<{}, {}, TwilioVoiceBody>
   // Fallback if user says nothing
   say(vr, "Sorry, I didn’t catch that. Goodbye.");
   vr.hangup();
+
 
   res.type("text/xml").send(vr.toString());
 });
@@ -158,40 +238,57 @@ app.post("/webhooks/twilio/inbound-call", (req: Request<{}, {}, TwilioVoiceBody>
  */
 app.post("/webhooks/twilio/handle-speech", (req: Request<{}, {}, TwilioVoiceBody>, res: Response) => {
   if (!twilioSignatureOk(req)) return res.status(403).send("Invalid Twilio signature");
-
-  const tenantId = resolveTenantId(req);
+  
   const callSid = req.body.CallSid || "unknown";
   const speech = (req.body.SpeechResult || "").trim();
   const confidence = req.body.Confidence ? Number(req.body.Confidence) : undefined;
+
+  const lower = speech.toLowerCase();
+  const to = req.body.To || req.body.Called;
+  const tenant = resolveTenantByTwilioNumber(to);
+  const tenantId = tenant.id;
+  
 
   req.log.info({ tenantId, callSid, speech, confidence }, "Speech received");
 
   const vr = new twiml.VoiceResponse();
 
+  // No speech
   if (!speech) {
     say(vr, "I didn’t hear anything. Please call again. Goodbye.");
     vr.hangup();
     return res.type("text/xml").send(vr.toString());
   }
 
-  // Demo intent routing (replace later with LLM + RAG)
-  const lower = speech.toLowerCase();
-  let answer: string;
+  // handoff fallback
+  const handoffRegex = /\b(owner|manager|human|agent|representative)\b|speak to (the )?(owner|manager)/i;
 
-  if (/(price|cost|how much)/i.test(lower)) {
-    answer = "A haircut is one hundred and twenty rand. A fade is one hundred and fifty rand.";
-  } else if (/(open|close|hours|time)/i.test(lower)) {
-    answer = "We are open Monday to Saturday from 9 AM to 7 PM.";
-  } else if (/(where|location|address|direction)/i.test(lower)) {
-    answer = "We are located at 123 Main Road, near Shoprite.";
-  } else if (/(book|booking|appointment)/i.test(lower)) {
-    answer = "Sure. Please tell me your name and preferred time. I will capture it and confirm.";
+  if (handoffRegex.test(speech)) {
+    say(vr, "Let me connect you to the owner.");
+
+    req.log.info({ tenantId, handoffNumber: tenant.handoffNumber }, "Handoff number check");
+
+    if (!tenant.handoffNumber || !tenant.handoffNumber.startsWith("+")) {
+      say(vr, "I can’t transfer right now. Please leave your number and we’ll call you back.");
+      vr.hangup();
+      return res.type("text/xml").send(vr.toString());
+    }
+    
+    vr.dial(tenant.handoffNumber);
+    return res.type("text/xml").send(vr.toString());
+  }
+ 
+  
+  const kb = loadKnowledgeBase(tenant.knowledgeBaseId);
+  const answer = answerFromKB(kb, speech);
+
+  if (answer) {
+    say(vr, answer);
   } else {
-    answer =
-      "I can help with prices, hours, location, and bookings. Please ask one of those, or tell me what you need and I will take your details.";
+    say(vr, "I can help with prices, hours, location, and bookings. What would you like to know?");
   }
 
-  say(vr, answer);
+
 
   // Loop another gather to keep the call going
   const action = buildUrl(`/webhooks/twilio/handle-speech?tenantId=${encodeURIComponent(tenantId)}`);

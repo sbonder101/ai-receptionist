@@ -1,0 +1,28 @@
+[
+  {
+    "id": "freshcuts-barber",
+    "businessName": "Fresh Cuts Barber",
+    "twilioNumber": "+27871234567",
+    "timezone": "Africa/Johannesburg",
+    "hours": {
+      "mon_fri": "09:00-19:00",
+      "sat": "09:00-17:00",
+      "sun": "closed"
+    },
+    "handoffNumber": "+27831230000",
+    "knowledgeBaseId": "kb_freshcuts"
+  },
+  {
+    "id": "demo-sbo-tech",
+    "businessName": "Sbo Tech Demo",
+    "twilioNumber": "+27870000000",
+    "timezone": "Africa/Johannesburg",
+    "hours": {
+      "mon_fri": "09:00-17:00",
+      "sat": "closed",
+      "sun": "closed"
+    },
+    "handoffNumber": "+27830000000",
+    "knowledgeBaseId": "kb_demo"
+  }
+]

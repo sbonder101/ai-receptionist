@@ -1,0 +1,14 @@
+{
+  "hours": "Monday to Friday 9am to 7pm, Saturday 9am to 5pm, closed Sundays.",
+  "address": "123 Main Road, next to Shoprite.",
+  "services": [
+    { "name": "Haircut", "price": 120 },
+    { "name": "Fade", "price": 150 },
+    { "name": "Beard trim", "price": 80 }
+  ],
+  "bookingRules": "Walk-ins welcome. Appointments recommended on weekends.",
+  "faqs": [
+    { "q": "Do you cut kids?", "a": "Yes, kids haircuts are welcome." },
+    { "q": "Do you accept cards?", "a": "Yes, we accept card and cash." }
+  ]
+}
