@@ -174,6 +174,13 @@ function say(vr: twiml.VoiceResponse, text: string) {
   vr.say({ voice: TTS_VOICE, language: TTS_LANG }, text);
 }
 
+function saySsml(vr: twiml.VoiceResponse, ssml: string) {
+  vr.say(
+    { voice: TTS_VOICE, language: TTS_LANG, ssml: true } as any,
+    ssml
+  );
+}
+
 function gatherSpeech(vr: twiml.VoiceResponse, actionUrl: string, prompt: string) {
   const gather = vr.gather({
     input: ["speech"],
@@ -248,7 +255,7 @@ app.post("/webhooks/twilio/inbound-call", (req: Request<{}, {}, TwilioVoiceBody>
   const vr = new twiml.VoiceResponse();
 
   // Greeting
-  say(
+  saySsml(
     vr,
     `
     <speak>
