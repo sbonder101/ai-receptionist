@@ -1,6 +1,7 @@
+// googleSheetsLogger.ts
 import { google } from "googleapis";
 
-type CallLogRow = {
+export type CallLogRow = {
   timestamp: string;
   tenantId: string;
   callSid: string;
@@ -9,6 +10,20 @@ type CallLogRow = {
   speech: string;
   confidence?: number;
   outcome: string;
+};
+
+export type BookingLogRow = {
+  timestamp: string;
+  tenantId: string;
+  callSid: string;
+  from: string;
+
+  serviceId: string;
+  serviceName: string;
+
+  startIso: string; // ISO timestamp
+  status: "requested" | "confirm_pending" | "confirmed" | "changed" | "cancelled" | "failed";
+  notes?: string; // optional free text (e.g. "asked for tomorrow morning")
 };
 
 function requiredEnv(name: string): string {
@@ -20,9 +35,7 @@ function requiredEnv(name: string): string {
 function getAuth() {
   const clientEmail = requiredEnv("GOOGLE_CLIENT_EMAIL");
   const privateKeyRaw = requiredEnv("GOOGLE_PRIVATE_KEY");
-
-  // Render commonly stores \n literally; convert to actual newlines:
-  const privateKey = privateKeyRaw.replace(/\\n/g, "\n");
+  const privateKey = privateKeyRaw.replace(/\\n/g, "\n"); // Render commonly stores \n literally
 
   return new google.auth.JWT({
     email: clientEmail,
@@ -31,9 +44,27 @@ function getAuth() {
   });
 }
 
-async function ensureHeaderRow(sheets: any, spreadsheetId: string, tabName: string) {
-  // Writes header to row 1 if empty (safe enough for demo).
-  const range = `${tabName}!A1:H1`;
+/**
+ * Small helper: normalize tab names and prevent broken ranges.
+ * If tab includes special chars/spaces, Sheets API expects it quoted: 'My Tab'!A1:H1
+ */
+function tabRange(tabName: string, a1: string) {
+  const safeTab =
+    /[ \-\(\)\[\]\{\}\.\,]/.test(tabName) || tabName.includes("'")
+      ? `'${tabName.replace(/'/g, "''")}'`
+      : tabName;
+  return `${safeTab}!${a1}`;
+}
+
+async function ensureHeaderRow(
+  sheets: any,
+  spreadsheetId: string,
+  tabName: string,
+  headerValues: string[],
+  headerRangeA1: string // e.g. "A1:H1"
+) {
+  const range = tabRange(tabName, headerRangeA1);
+
   const existing = await sheets.spreadsheets.values.get({ spreadsheetId, range });
   const row = existing.data.values?.[0];
 
@@ -43,21 +74,38 @@ async function ensureHeaderRow(sheets: any, spreadsheetId: string, tabName: stri
     spreadsheetId,
     range,
     valueInputOption: "RAW",
-    requestBody: {
-      values: [[
-        "Timestamp",
-        "Tenant",
-        "CallSid",
-        "From",
-        "To",
-        "Speech",
-        "Confidence",
-        "Outcome"
-      ]],
-    },
+    requestBody: { values: [headerValues] },
   });
 }
 
+function withRetry<T>(fn: () => Promise<T>, opts?: { retries?: number; baseMs?: number }) {
+  const retries = opts?.retries ?? 3;
+  const baseMs = opts?.baseMs ?? 400;
+
+  return (async () => {
+    let lastErr: any = null;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        return await fn();
+      } catch (e: any) {
+        lastErr = e;
+        const status = e?.code || e?.response?.status;
+        const retryable =
+          status === 429 || (typeof status === "number" && status >= 500 && status <= 599);
+
+        if (!retryable || attempt === retries) break;
+
+        const delay = baseMs * Math.pow(2, attempt);
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+    throw lastErr;
+  })();
+}
+
+/** -------------------------
+ *  CALLS
+ * ------------------------- */
 export async function appendCallLog(row: CallLogRow) {
   const spreadsheetId = requiredEnv("GSHEETS_SPREADSHEET_ID");
   const tabName = process.env.GSHEETS_TAB_NAME || "Calls";
@@ -65,24 +113,91 @@ export async function appendCallLog(row: CallLogRow) {
   const auth = getAuth();
   const sheets = google.sheets({ version: "v4", auth });
 
-  await ensureHeaderRow(sheets, spreadsheetId, tabName);
+  await withRetry(() =>
+    ensureHeaderRow(
+      sheets,
+      spreadsheetId,
+      tabName,
+      ["Timestamp", "Tenant", "CallSid", "From", "To", "Speech", "Confidence", "Outcome"],
+      "A1:H1"
+    )
+  );
 
-  await sheets.spreadsheets.values.append({
-    spreadsheetId,
-    range: `${tabName}!A:H`,
-    valueInputOption: "USER_ENTERED",
-    insertDataOption: "INSERT_ROWS",
-    requestBody: {
-      values: [[
-        row.timestamp,
-        row.tenantId,
-        row.callSid,
-        row.from,
-        row.to,
-        row.speech,
-        row.confidence ?? "",
-        row.outcome,
-      ]],
-    },
-  });
+  await withRetry(() =>
+    sheets.spreadsheets.values.append({
+      spreadsheetId,
+      range: tabRange(tabName, "A:H"),
+      valueInputOption: "USER_ENTERED",
+      insertDataOption: "INSERT_ROWS",
+      requestBody: {
+        values: [
+          [
+            row.timestamp,
+            row.tenantId,
+            row.callSid,
+            row.from,
+            row.to,
+            row.speech,
+            row.confidence ?? "",
+            row.outcome,
+          ],
+        ],
+      },
+    })
+  );
+}
+
+/** -------------------------
+ *  BOOKINGS
+ * ------------------------- */
+export async function appendBookingLog(row: BookingLogRow) {
+  const spreadsheetId = requiredEnv("GSHEETS_SPREADSHEET_ID");
+  const tabName = process.env.GSHEETS_BOOKINGS_TAB_NAME || "Bookings";
+
+  const auth = getAuth();
+  const sheets = google.sheets({ version: "v4", auth });
+
+  await withRetry(() =>
+    ensureHeaderRow(
+      sheets,
+      spreadsheetId,
+      tabName,
+      [
+        "Timestamp",
+        "Tenant",
+        "CallSid",
+        "From",
+        "ServiceId",
+        "ServiceName",
+        "StartISO",
+        "Status",
+        "Notes",
+      ],
+      "A1:I1"
+    )
+  );
+
+  await withRetry(() =>
+    sheets.spreadsheets.values.append({
+      spreadsheetId,
+      range: tabRange(tabName, "A:I"),
+      valueInputOption: "USER_ENTERED",
+      insertDataOption: "INSERT_ROWS",
+      requestBody: {
+        values: [
+          [
+            row.timestamp,
+            row.tenantId,
+            row.callSid,
+            row.from,
+            row.serviceId,
+            row.serviceName,
+            row.startIso,
+            row.status,
+            row.notes ?? "",
+          ],
+        ],
+      },
+    })
+  );
 }
