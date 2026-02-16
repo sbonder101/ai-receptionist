@@ -1,0 +1,283 @@
+import { assignSimilarDate, assignSimilarTime, implySimilarTime } from "./utils/dates.js";
+import { toTimezoneOffset } from "./timezone.js";
+import { addDuration, EmptyDuration } from "./calculation/duration.js";
+export class ReferenceWithTimezone {
+    instant;
+    timezoneOffset;
+    constructor(instant, timezoneOffset) {
+        this.instant = instant ?? new Date();
+        this.timezoneOffset = timezoneOffset ?? null;
+    }
+    static fromDate(date) {
+        return new ReferenceWithTimezone(date);
+    }
+    static fromInput(input, timezoneOverrides) {
+        if (input instanceof Date) {
+            return ReferenceWithTimezone.fromDate(input);
+        }
+        const instant = input?.instant ?? new Date();
+        const timezoneOffset = toTimezoneOffset(input?.timezone, instant, timezoneOverrides);
+        return new ReferenceWithTimezone(instant, timezoneOffset);
+    }
+    getDateWithAdjustedTimezone() {
+        const date = new Date(this.instant);
+        if (this.timezoneOffset !== null) {
+            date.setMinutes(date.getMinutes() - this.getSystemTimezoneAdjustmentMinute(this.instant));
+        }
+        return date;
+    }
+    getSystemTimezoneAdjustmentMinute(date, overrideTimezoneOffset) {
+        if (!date || date.getTime() < 0) {
+            date = new Date();
+        }
+        const currentTimezoneOffset = -date.getTimezoneOffset();
+        const targetTimezoneOffset = overrideTimezoneOffset ?? this.timezoneOffset ?? currentTimezoneOffset;
+        return currentTimezoneOffset - targetTimezoneOffset;
+    }
+    getTimezoneOffset() {
+        return this.timezoneOffset ?? -this.instant.getTimezoneOffset();
+    }
+}
+export class ParsingComponents {
+    knownValues;
+    impliedValues;
+    reference;
+    _tags = new Set();
+    constructor(reference, knownComponents) {
+        this.reference = reference;
+        this.knownValues = {};
+        this.impliedValues = {};
+        if (knownComponents) {
+            for (const key in knownComponents) {
+                this.knownValues[key] = knownComponents[key];
+            }
+        }
+        const date = reference.getDateWithAdjustedTimezone();
+        this.imply("day", date.getDate());
+        this.imply("month", date.getMonth() + 1);
+        this.imply("year", date.getFullYear());
+        this.imply("hour", 12);
+        this.imply("minute", 0);
+        this.imply("second", 0);
+        this.imply("millisecond", 0);
+    }
+    static createRelativeFromReference(reference, duration = EmptyDuration) {
+        let date = addDuration(reference.getDateWithAdjustedTimezone(), duration);
+        const components = new ParsingComponents(reference);
+        components.addTag("result/relativeDate");
+        if ("hour" in duration || "minute" in duration || "second" in duration || "millisecond" in duration) {
+            components.addTag("result/relativeDateAndTime");
+            assignSimilarTime(components, date);
+            assignSimilarDate(components, date);
+            components.assign("timezoneOffset", reference.getTimezoneOffset());
+        }
+        else {
+            implySimilarTime(components, date);
+            components.imply("timezoneOffset", reference.getTimezoneOffset());
+            if ("day" in duration) {
+                components.assign("day", date.getDate());
+                components.assign("month", date.getMonth() + 1);
+                components.assign("year", date.getFullYear());
+                components.assign("weekday", date.getDay());
+            }
+            else if ("week" in duration) {
+                components.assign("day", date.getDate());
+                components.assign("month", date.getMonth() + 1);
+                components.assign("year", date.getFullYear());
+                components.imply("weekday", date.getDay());
+            }
+            else {
+                components.imply("day", date.getDate());
+                if ("month" in duration) {
+                    components.assign("month", date.getMonth() + 1);
+                    components.assign("year", date.getFullYear());
+                }
+                else {
+                    components.imply("month", date.getMonth() + 1);
+                    if ("year" in duration) {
+                        components.assign("year", date.getFullYear());
+                    }
+                    else {
+                        components.imply("year", date.getFullYear());
+                    }
+                }
+            }
+        }
+        return components;
+    }
+    get(component) {
+        if (component in this.knownValues) {
+            return this.knownValues[component];
+        }
+        if (component in this.impliedValues) {
+            return this.impliedValues[component];
+        }
+        return null;
+    }
+    isCertain(component) {
+        return component in this.knownValues;
+    }
+    getCertainComponents() {
+        return Object.keys(this.knownValues);
+    }
+    imply(component, value) {
+        if (component in this.knownValues) {
+            return this;
+        }
+        this.impliedValues[component] = value;
+        return this;
+    }
+    assign(component, value) {
+        this.knownValues[component] = value;
+        delete this.impliedValues[component];
+        return this;
+    }
+    addDurationAsImplied(duration) {
+        const currentDate = this.dateWithoutTimezoneAdjustment();
+        const date = addDuration(currentDate, duration);
+        if ("day" in duration || "week" in duration || "month" in duration || "year" in duration) {
+            this.delete(["day", "weekday", "month", "year"]);
+            this.imply("day", date.getDate());
+            this.imply("weekday", date.getDay());
+            this.imply("month", date.getMonth() + 1);
+            this.imply("year", date.getFullYear());
+        }
+        if ("second" in duration || "minute" in duration || "hour" in duration) {
+            this.delete(["second", "minute", "hour"]);
+            this.imply("second", date.getSeconds());
+            this.imply("minute", date.getMinutes());
+            this.imply("hour", date.getHours());
+        }
+        return this;
+    }
+    delete(components) {
+        if (typeof components === "string") {
+            components = [components];
+        }
+        for (const component of components) {
+            delete this.knownValues[component];
+            delete this.impliedValues[component];
+        }
+    }
+    clone() {
+        const component = new ParsingComponents(this.reference);
+        component.knownValues = {};
+        component.impliedValues = {};
+        for (const key in this.knownValues) {
+            component.knownValues[key] = this.knownValues[key];
+        }
+        for (const key in this.impliedValues) {
+            component.impliedValues[key] = this.impliedValues[key];
+        }
+        return component;
+    }
+    isOnlyDate() {
+        return !this.isCertain("hour") && !this.isCertain("minute") && !this.isCertain("second");
+    }
+    isOnlyTime() {
+        return (!this.isCertain("weekday") && !this.isCertain("day") && !this.isCertain("month") && !this.isCertain("year"));
+    }
+    isOnlyWeekdayComponent() {
+        return this.isCertain("weekday") && !this.isCertain("day") && !this.isCertain("month");
+    }
+    isDateWithUnknownYear() {
+        return this.isCertain("month") && !this.isCertain("year");
+    }
+    isValidDate() {
+        const date = this.dateWithoutTimezoneAdjustment();
+        if (date.getFullYear() !== this.get("year"))
+            return false;
+        if (date.getMonth() !== this.get("month") - 1)
+            return false;
+        if (date.getDate() !== this.get("day"))
+            return false;
+        if (this.get("hour") != null && date.getHours() != this.get("hour"))
+            return false;
+        if (this.get("minute") != null && date.getMinutes() != this.get("minute"))
+            return false;
+        return true;
+    }
+    toString() {
+        return `[ParsingComponents {
+            tags: ${JSON.stringify(Array.from(this._tags).sort())}, 
+            knownValues: ${JSON.stringify(this.knownValues)}, 
+            impliedValues: ${JSON.stringify(this.impliedValues)}}, 
+            reference: ${JSON.stringify(this.reference)}]`;
+    }
+    date() {
+        const date = this.dateWithoutTimezoneAdjustment();
+        const timezoneAdjustment = this.reference.getSystemTimezoneAdjustmentMinute(date, this.get("timezoneOffset"));
+        return new Date(date.getTime() + timezoneAdjustment * 60000);
+    }
+    addTag(tag) {
+        this._tags.add(tag);
+        return this;
+    }
+    addTags(tags) {
+        for (const tag of tags) {
+            this._tags.add(tag);
+        }
+        return this;
+    }
+    tags() {
+        return new Set(this._tags);
+    }
+    dateWithoutTimezoneAdjustment() {
+        const date = new Date(this.get("year"), this.get("month") - 1, this.get("day"), this.get("hour"), this.get("minute"), this.get("second"), this.get("millisecond"));
+        date.setFullYear(this.get("year"));
+        return date;
+    }
+}
+export class ParsingResult {
+    refDate;
+    index;
+    text;
+    reference;
+    start;
+    end;
+    constructor(reference, index, text, start, end) {
+        this.reference = reference;
+        this.refDate = reference.instant;
+        this.index = index;
+        this.text = text;
+        this.start = start || new ParsingComponents(reference);
+        this.end = end;
+    }
+    clone() {
+        const result = new ParsingResult(this.reference, this.index, this.text);
+        result.start = this.start ? this.start.clone() : null;
+        result.end = this.end ? this.end.clone() : null;
+        return result;
+    }
+    date() {
+        return this.start.date();
+    }
+    addTag(tag) {
+        this.start.addTag(tag);
+        if (this.end) {
+            this.end.addTag(tag);
+        }
+        return this;
+    }
+    addTags(tags) {
+        this.start.addTags(tags);
+        if (this.end) {
+            this.end.addTags(tags);
+        }
+        return this;
+    }
+    tags() {
+        const combinedTags = new Set(this.start.tags());
+        if (this.end) {
+            for (const tag of this.end.tags()) {
+                combinedTags.add(tag);
+            }
+        }
+        return combinedTags;
+    }
+    toString() {
+        const tags = Array.from(this.tags()).sort();
+        return `[ParsingResult {index: ${this.index}, text: '${this.text}', tags: ${JSON.stringify(tags)} ...}]`;
+    }
+}
+//# sourceMappingURL=results.js.map

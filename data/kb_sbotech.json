@@ -1,21 +1,35 @@
 {
-  "hours": "We’re open Monday to Friday 9 AM to 6 PM, and Saturdays 9 AM to 3 PM.",
-  "address": "Johannesburg, Gauteng (exact address available on request).",
+  "businessName": "Sbo Tech Demo",
+  "timezone": "Africa/Johannesburg",
+  "address": "123 Main Rd, Durban",
+  "handoffNumber": "+2783xxxxxxx",
+  "hours": {
+    "mon": [{"open": "09:00", "close": "18:00"}],
+    "tue": [{"open": "09:00", "close": "18:00"}],
+    "wed": [{"open": "09:00", "close": "18:00"}],
+    "thu": [{"open": "09:00", "close": "18:00"}],
+    "fri": [{"open": "09:00", "close": "18:00"}],
+    "sat": [{"open": "09:00", "close": "15:00"}],
+    "sun": []
+  },
   "services": [
-    { "name": "Haircut", "price": "120" },
-    { "name": "Fade", "price": "150" },
-    { "name": "Beard Trim", "price": "80" }
+    { "id": "haircut", "name": "Haircut", "priceZar": 120, "durationMin": 30, "keywords": ["haircut", "cut"] },
+    { "id": "fade", "name": "Fade", "priceZar": 150, "durationMin": 45, "keywords": ["fade", "taper"] },
+    { "id": "beard", "name": "Beard Trim", "priceZar": 80, "durationMin": 20, "keywords": ["beard", "trim"] }
   ],
   "booking": {
-    "allowed": true,
-    "notes": "Appointments are available. Tell me the day and time you prefer."
+    "slotSizeMin": 15,
+    "bufferMin": 5,
+    "sameDayCutoffTime": "16:00",
+    "leadTimeMin": 30,
+    "maxDaysAhead": 30
   },
   "faqs": [
-    { "q": "Do you accept cards?", "a": "Yes, we accept cash and card." },
-    { "q": "Do you do kids cuts?", "a": "Yes, kids cuts are available." },
-    { "q": "Do I need to book?", "a": "Walk-ins are welcome, but booking is recommended during busy times." }
+    { "q": "Do you take card?", "a": "Yes, we accept card and cash.", "keywords": ["card", "pay", "payment"] },
+    { "q": "Do I need to book?", "a": "Walk-ins are welcome, but bookings get priority.", "keywords": ["walk-in", "book", "appointment"] }
   ],
   "policies": {
-    "late": "If you’re more than 10 minutes late, your slot may be given to the next customer."
+    "late": "If you're more than 10 minutes late we may need to reschedule.",
+    "cancellation": "Please cancel at least 2 hours before your slot."
   }
 }

@@ -14,6 +14,7 @@ const twilio_1 = require("twilio");
 const webhooks_1 = require("twilio/lib/webhooks/webhooks");
 const fs_1 = __importDefault(require("fs"));
 const path_1 = __importDefault(require("path"));
+const googleSheetsLogger_1 = require("./googleSheetsLogger");
 // If you want JSON import: enable resolveJsonModule in tsconfig.
 // Alternatively, read tenants via fs (shown below) to avoid TS JSON import issues.
 dotenv_1.default.config();
@@ -504,6 +505,23 @@ app.post("/webhooks/twilio/handle-speech", (req, res) => {
         What would you like to know?
       </speak>`);
     }
+    // log call in google sheets
+    const handoffRegex = /\b(owner|manager|human|agent|representative)\b|speak to (the )?(owner|manager)/i;
+    const outcome = handoffRegex.test(speech)
+        ? "handoff"
+        : answer
+            ? "answered"
+            : "fallback";
+    (0, googleSheetsLogger_1.appendCallLog)({
+        timestamp: new Date().toISOString(),
+        tenantId: tenant.id,
+        callSid,
+        from: req.body.From || "",
+        to: (req.body.To || req.body.Called || "").toString(),
+        speech,
+        confidence,
+        outcome,
+    }).catch((e) => req.log.error({ e }, "Failed to append call log to Google Sheets"));
     // Continue conversation (cap turns to avoid endless loop)
     if (session.turns >= 4) {
         sayText(vr, "Thanks for calling. Goodbye.");

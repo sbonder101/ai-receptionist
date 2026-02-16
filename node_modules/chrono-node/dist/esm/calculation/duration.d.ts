@@ -1,0 +1,13 @@
+import { Timeunit } from "../types.js";
+export type TimeunitShorten = "y" | "mo" | "M" | "w" | "d" | "h" | "m" | "s" | "ms";
+export type TimeunitSpecial = "quarter";
+export type Duration = {
+    [c in Timeunit | TimeunitSpecial | TimeunitShorten]?: number;
+};
+export declare const EmptyDuration: {
+    day: number;
+    second: number;
+    millisecond: number;
+};
+export declare function addDuration(ref: Date, duration: Duration): Date;
+export declare function reverseDuration(duration: Duration): Duration;
