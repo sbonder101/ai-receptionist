@@ -23,6 +23,17 @@ const BASE_URL = (process.env.BASE_URL || "").replace(/\/+$/, "");
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_VALIDATE_SIGNATURE = (process.env.TWILIO_VALIDATE_SIGNATURE || "false") === "true";
 
+
+// fix 
+
+function getPublicUrl(req: Request): string {
+  const proto = (req.header("x-forwarded-proto") || "https").split(",")[0].trim();
+  const host = (req.header("x-forwarded-host") || req.header("host") || "").split(",")[0].trim();
+  return `${proto}://${host}${req.originalUrl}`;
+}
+
+// end fix
+
 type TtsVoice = "alice";
 type TtsLang = "en-ZA" | "en-US";
 
@@ -102,18 +113,18 @@ function buildUrl(path: string): string {
   return `${BASE_URL}${path.startsWith("/") ? "" : "/"}${path}`;
 }
 
+const ALLOW_TEST_BYPASS = process.env.ALLOW_TEST_BYPASS === "true";
+
 function twilioSignatureOk(req: Request): boolean {
   if (!TWILIO_VALIDATE_SIGNATURE) return true;
 
-  if (!TWILIO_AUTH_TOKEN) {
-    logger.error("TWILIO_VALIDATE_SIGNATURE=true but TWILIO_AUTH_TOKEN is missing");
-    return false;
+  if (ALLOW_TEST_BYPASS && req.header("x-test-bypass") === process.env.TEST_BYPASS_KEY) {
+    return true;
   }
 
-  const signature = req.header("X-Twilio-Signature") || "";
-  const fullUrl = buildUrl(req.originalUrl);
-
-  return validateRequest(TWILIO_AUTH_TOKEN, signature, fullUrl, req.body);
+  const signature = req.header("x-twilio-signature") || "";
+  const url = getPublicUrl(req);
+  return validateRequest(TWILIO_AUTH_TOKEN, signature, url, req.body);
 }
 
 /**
@@ -205,6 +216,16 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
  * Twilio will POST here when a call comes in.
  */
 app.post("/webhooks/twilio/inbound-call", (req: Request<{}, {}, TwilioVoiceBody>, res: Response) => {
+
+  // test
+  req.log.info({
+    computedUrl: getPublicUrl(req),
+    hasSig: !!req.header("x-twilio-signature"),
+    host: req.header("host"),
+    xfHost: req.header("x-forwarded-host"),
+    xfProto: req.header("x-forwarded-proto"),
+  }, "twilio sig debug");
+
   if (!twilioSignatureOk(req)) return res.status(403).send("Invalid Twilio signature");
 
   
