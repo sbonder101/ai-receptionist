@@ -58,8 +58,17 @@ function pickLang(v: string | undefined): TtsLang {
 
 function loadKnowledgeBase(knowledgeBaseId: string) {
   const file = path.join(process.cwd(), "data", `${knowledgeBaseId}.json`);
-  if (!fs.existsSync(file)) throw new Error(`KB file not found: ${file}`);
-  return JSON.parse(fs.readFileSync(file, "utf-8"));
+
+  if (!fs.existsSync(file)) {
+    throw new Error(`KB file not found: ${file}`);
+  }
+
+  const raw = fs.readFileSync(file, "utf-8");
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new Error(`KB JSON invalid: ${file}`);
+  }
 }
 
 const TTS_VOICE: TtsVoice = pickVoice(process.env.TTS_VOICE);
@@ -297,7 +306,7 @@ app.post("/webhooks/twilio/handle-speech", (req: Request<{}, {}, TwilioVoiceBody
   let kb;
   try {
     kb = loadKnowledgeBase(tenant.knowledgeBaseId);
-  } catch (e) {
+  } catch (err) {
     // req.log.error({ e, tenantId: tenant.id }, "KB load failed");
     // say(vr, "Sorry, our system is having trouble right now. Please try again later.");
     // vr.hangup();
