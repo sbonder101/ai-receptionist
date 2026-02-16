@@ -52,7 +52,7 @@ type TtsVoice =
 type TtsLang = "en-US" | "en-GB";
 
 function pickVoice(v: string | undefined): TtsVoice {
-  return v === "alice" ? "alice" : "alice";
+  return v === "alice" ? "alice" : "Polly.Amy-Neural";
 }
 
 function pickLang(v: string | undefined): TtsLang {
