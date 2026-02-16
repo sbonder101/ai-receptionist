@@ -29,8 +29,10 @@ const TWILIO_VALIDATE_SIGNATURE = (process.env.TWILIO_VALIDATE_SIGNATURE || "fal
 function getPublicUrl(req: Request): string {
   const proto = (req.header("x-forwarded-proto") || "https").split(",")[0].trim();
   const host = (req.header("x-forwarded-host") || req.header("host") || "").split(",")[0].trim();
-  return `${proto}://${host}${req.originalUrl}`;
+  return `${proto}://${host}${req.path}`;
 }
+
+
 
 // end fix
 
@@ -56,6 +58,7 @@ function pickLang(v: string | undefined): TtsLang {
 
 function loadKnowledgeBase(knowledgeBaseId: string) {
   const file = path.join(process.cwd(), "data", `${knowledgeBaseId}.json`);
+  if (!fs.existsSync(file)) throw new Error(`KB file not found: ${file}`);
   return JSON.parse(fs.readFileSync(file, "utf-8"));
 }
 
@@ -121,29 +124,29 @@ function buildUrl(path: string): string {
   return `${BASE_URL}${path.startsWith("/") ? "" : "/"}${path}`;
 }
 
+function buildAbsoluteUrl(req: Request, path: string): string {
+  const proto = (req.header("x-forwarded-proto") || "https").split(",")[0].trim();
+  const host = (req.header("x-forwarded-host") || req.header("host") || "").split(",")[0].trim();
+  return `${proto}://${host}${path.startsWith("/") ? path : `/${path}`}`;
+}
+
 const ALLOW_TEST_BYPASS = process.env.ALLOW_TEST_BYPASS === "true";
 
 function twilioSignatureOk(req: Request): boolean {
-  if (!TWILIO_VALIDATE_SIGNATURE) return true;
+  
 
   if (ALLOW_TEST_BYPASS && req.header("x-test-bypass") === process.env.TEST_BYPASS_KEY) {
     return true;
   }
+
+  if (!TWILIO_VALIDATE_SIGNATURE) return true;
 
   const signature = req.header("x-twilio-signature") || "";
   const url = getPublicUrl(req);
   return validateRequest(TWILIO_AUTH_TOKEN, signature, url, req.body);
 }
 
-/**
- * Tenant routing (demo).
- * Later:
- * - map Called/To numbers to tenant
- * - or use query param tenantId
- */
-function resolveTenantId(req: Request): string {
-  return (req.query.tenantId as string) || "demo-sbo-tech";
-}
+
 
 type TwilioVoiceBody = {
   CallSid?: string;
@@ -170,23 +173,6 @@ function gatherSpeech(vr: twiml.VoiceResponse, actionUrl: string, prompt: string
   gather.say({ voice: TTS_VOICE, language: TTS_LANG }, prompt);
 }
 
-function twilioAuth(req: Request, res: Response, next: NextFunction) {
-  const signature = req.headers["x-twilio-signature"] as string;
-  const url = `${process.env.PUBLIC_BASE_URL}${req.originalUrl}`;
-
-  const isValid = validateRequest(
-    process.env.TWILIO_AUTH_TOKEN!,
-    signature,
-    url,
-    req.body
-  );
-
-  if (!isValid) {
-    return res.status(403).send("Forbidden");
-  }
-
-  next();
-}
 
 function answerFromKB(kb: any, utterance: string): string | null {
   const u = utterance.toLowerCase();
@@ -250,7 +236,7 @@ app.post("/webhooks/twilio/inbound-call", (req: Request<{}, {}, TwilioVoiceBody>
   // Greeting
   say(vr, `Hi, you’ve reached ${tenant.businessName}. I’m the AI receptionist. How can I help you?`);
   // Gather initial speech
-  const action = buildUrl(`/webhooks/twilio/handle-speech?tenantId=${encodeURIComponent(tenantId)}`);
+  const action = buildAbsoluteUrl(req, `/webhooks/twilio/handle-speech`);
   gatherSpeech(vr, action, "Please tell me what you need.");
 
   // Fallback if user says nothing
@@ -308,7 +294,16 @@ app.post("/webhooks/twilio/handle-speech", (req: Request<{}, {}, TwilioVoiceBody
   }
  
   
-  const kb = loadKnowledgeBase(tenant.knowledgeBaseId);
+  let kb;
+  try {
+    kb = loadKnowledgeBase(tenant.knowledgeBaseId);
+  } catch (e) {
+    req.log.error({ e, tenantId: tenant.id }, "KB load failed");
+    say(vr, "Sorry, our system is having trouble right now. Please try again later.");
+    vr.hangup();
+    return res.type("text/xml").send(vr.toString());
+  }
+  
   const answer = answerFromKB(kb, speech);
 
   if (answer) {
@@ -320,7 +315,7 @@ app.post("/webhooks/twilio/handle-speech", (req: Request<{}, {}, TwilioVoiceBody
 
 
   // Loop another gather to keep the call going
-  const action = buildUrl(`/webhooks/twilio/handle-speech?tenantId=${encodeURIComponent(tenantId)}`);
+  const action = buildAbsoluteUrl(req, `/webhooks/twilio/handle-speech`);
   gatherSpeech(vr, action, "What else can I help you with?");
 
   say(vr, "Okay, goodbye.");
