@@ -12,18 +12,17 @@ export type CallLogRow = {
   outcome: string;
 };
 
-export type BookingLogRow = {
+type BookingRow = {
   timestamp: string;
   tenantId: string;
   callSid: string;
-  from: string;
-
-  serviceId: string;
-  serviceName: string;
-
-  startIso: string; // ISO timestamp
-  status: "requested" | "confirm_pending" | "confirmed" | "changed" | "cancelled" | "failed";
-  notes?: string; // optional free text (e.g. "asked for tomorrow morning")
+  name: string;
+  phone: string;
+  service: string;
+  startTime: string;      // ISO
+  durationMin: number | string;
+  status: string;         // confirmed | cancelled | pending
+  notes: string;
 };
 
 function requiredEnv(name: string): string {
@@ -103,6 +102,7 @@ function withRetry<T>(fn: () => Promise<T>, opts?: { retries?: number; baseMs?: 
   })();
 }
 
+
 /** -------------------------
  *  CALLS
  * ------------------------- */
@@ -150,54 +150,46 @@ export async function appendCallLog(row: CallLogRow) {
 /** -------------------------
  *  BOOKINGS
  * ------------------------- */
-export async function appendBookingLog(row: BookingLogRow) {
+export async function appendBookingLog(row: BookingRow) {
   const spreadsheetId = requiredEnv("GSHEETS_SPREADSHEET_ID");
   const tabName = process.env.GSHEETS_BOOKINGS_TAB_NAME || "Bookings";
 
   const auth = getAuth();
   const sheets = google.sheets({ version: "v4", auth });
 
-  await withRetry(() =>
-    ensureHeaderRow(
-      sheets,
-      spreadsheetId,
-      tabName,
-      [
-        "Timestamp",
-        "Tenant",
-        "CallSid",
-        "From",
-        "ServiceId",
-        "ServiceName",
-        "StartISO",
-        "Status",
-        "Notes",
-      ],
-      "A1:I1"
-    )
-  );
+  const headers = [
+    "timestamp",
+    "tenantId",
+    "callSid",
+    "name",
+    "phone",
+    "service",
+    "startTime",
+    "durationMin",
+    "status",
+    "notes",
+  ];
 
-  await withRetry(() =>
-    sheets.spreadsheets.values.append({
-      spreadsheetId,
-      range: tabRange(tabName, "A:I"),
-      valueInputOption: "USER_ENTERED",
-      insertDataOption: "INSERT_ROWS",
-      requestBody: {
-        values: [
-          [
-            row.timestamp,
-            row.tenantId,
-            row.callSid,
-            row.from,
-            row.serviceId,
-            row.serviceName,
-            row.startIso,
-            row.status,
-            row.notes ?? "",
-          ],
-        ],
-      },
-    })
-  );
+//   await ensureHeaderRow(sheets, spreadsheetId, tabName, headers);
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId,
+    range: `${tabName}!A:J`,
+    valueInputOption: "USER_ENTERED",
+    insertDataOption: "INSERT_ROWS",
+    requestBody: {
+      values: [[
+        row.timestamp,
+        row.tenantId,
+        row.callSid,
+        row.name,
+        row.phone,
+        row.service,
+        row.startTime,
+        row.durationMin,
+        row.status,
+        row.notes,
+      ]],
+    },
+  });
 }

@@ -19,7 +19,7 @@ import { twiml } from "twilio";
 import { validateRequest } from "twilio/lib/webhooks/webhooks";
 import fs from "fs";
 import path from "path";
-import { appendCallLog } from "./googleSheetsLogger";
+import { appendCallLog, appendBookingLog } from "./googleSheetsLogger";
 
 dotenv.config();
 
@@ -676,21 +676,38 @@ async function handleBookingTurn(args: {
     }
 
     // Confirmed:
-    b.stage = "done";
+    if (/\b(yes|yeah|yep|confirm|correct|okay|ok)\b/.test(t)) {
+      b.stage = "done";
 
-    saySsml(vr, `<speak>Perfect. You’re booked. We’ll see you then.</speak>`);
+      // 1) write booking row first (don’t silently fail)
+      try {
+        const svc = (kb.services || []).find((s: any) => (s.id || s.name) === b.serviceId) ?? null;
+        const durationMin = svc?.durationMin ?? 30;
 
-    // Optional: log booking confirmation as a call-log outcome
-    appendCallLog({
-      timestamp: new Date().toISOString(),
-      tenantId: tenant.id,
-      callSid: session.callSid,
-      from: session.from,
-      to: session.to,
-      speech: `BOOKING_CONFIRMED service=${b.serviceId ?? ""} start=${b.startIso ?? ""}`,
-      confidence,
-      outcome: "booking_confirmed",
-    }).catch((e) => req.log.error({ e }, "Failed to append booking confirmation to Google Sheets"));
+        await appendBookingLog({
+          timestamp: new Date().toISOString(),
+          tenantId: tenant.id,
+          callSid: session.callSid,
+          name: "",               // later you can collect caller name
+          phone: session.from,    // Twilio From is the caller number
+          service: b.serviceName ?? "",
+          startTime: b.startIso ?? "",
+          durationMin,
+          status: "confirmed",
+          notes: "confirmed via voice",
+        });
+      } catch (e) {
+        req.log.error({ e }, "appendBookingLog failed");
+      }
+
+      // 2) confirm to caller
+      saySsml(vr, `<speak>Perfect. You’re booked. We’ll see you then.</speak>`);
+
+      // 3) end the call (prevents random follow-up prompts)
+      sayText(vr, "Goodbye.");
+      vr.hangup();
+      return res.type("text/xml").send(vr.toString());
+    }
 
     return continueOrEnd(res, vr, tenant.id, true);
   }
