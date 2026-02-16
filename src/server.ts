@@ -44,7 +44,11 @@ function normalizeBaseUrl(u: string): string {
   return trimmed;
 }
 
-type TtsVoice = "alice";
+type TtsVoice =
+  | "alice"
+  | "Polly.Amy-Neural"
+  | "Polly.Matthew-Neural"
+  | "Polly.Emma-Neural"; // example
 type TtsLang = "en-US" | "en-GB";
 
 function pickVoice(v: string | undefined): TtsVoice {
