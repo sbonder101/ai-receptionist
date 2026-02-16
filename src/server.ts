@@ -181,6 +181,7 @@ function gatherSpeech(vr: twiml.VoiceResponse, actionUrl: string, prompt: string
     action: actionUrl,
     method: "POST",
     language: TTS_LANG,
+    bargeIn: true,   // 🔥 allows interrupt
   } as any);
 
   gather.say({ voice: TTS_VOICE, language: TTS_LANG }, prompt);
