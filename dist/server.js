@@ -314,11 +314,26 @@ function isOpenNow(tenant, now = new Date()) {
 /** -------------------------
  *  TWIML HELPERS
  * ------------------------- */
+
+function toPlainString(x) {
+  if (x === null || x === undefined) return "";
+  if (typeof x === "string") return x;
+  if (typeof x === "number" || typeof x === "boolean" || typeof x === "bigint") return String(x);
+  if (x instanceof Date) return x.toISOString();
+  // Arrays / Objects -> JSON (but keep it short)
+  try {
+    const s = JSON.stringify(x);
+    return s && s !== "null" ? s : "";
+  } catch {
+    return String(x);
+  }
+}
+
 function sayText(vr, text) {
-    const clean = (text || "").trim();
-    if (!clean)
-        return;
-    vr.say({ voice: TTS_VOICE, language: TTS_LANG }, clean);
+  const clean = toPlainString(text).trim();
+  if (!clean) return;
+  req.log.info({ type: typeof answer, isArray: Array.isArray(answer) }, "Answer type");
+  vr.say({ voice: TTS_VOICE, language: TTS_LANG }, clean);
 }
 function saySsml(vr, ssml) {
     // IMPORTANT:
@@ -480,7 +495,7 @@ app.post("/webhooks/twilio/handle-speech", (req, res) => {
     if (intent === "PRICING")
         answer = formatPrices(kb.services);
     else if (intent === "HOURS")
-        answer = kb.hours || "I can share hours once they’re provided by the business.";
+         answer = formatHoursForHumans(kb);
     else if (intent === "ADDRESS")
         answer = kb.address || "I can share the address once it’s provided by the business.";
     else if (intent === "BOOKING")
