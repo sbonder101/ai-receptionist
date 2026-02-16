@@ -174,13 +174,6 @@ function say(vr: twiml.VoiceResponse, text: string) {
   vr.say({ voice: TTS_VOICE, language: TTS_LANG }, text);
 }
 
-function saySsml(vr: twiml.VoiceResponse, ssml: string) {
-  vr.say(
-    { voice: TTS_VOICE, language: TTS_LANG, ssml: true } as any,
-    ssml
-  );
-}
-
 function gatherSpeech(vr: twiml.VoiceResponse, actionUrl: string, prompt: string) {
   const gather = vr.gather({
     input: ["speech"],
@@ -193,20 +186,6 @@ function gatherSpeech(vr: twiml.VoiceResponse, actionUrl: string, prompt: string
 
   gather.say({ voice: TTS_VOICE, language: TTS_LANG }, prompt);
 }
-
-function xmlEscape(s: string) {
-  return s.replace(/&/g, "&amp;")
-          .replace(/</g, "&lt;")
-          .replace(/>/g, "&gt;")
-          .replace(/"/g, "&quot;")
-          .replace(/'/g, "&apos;");
-}
-
-function saySsmlRaw(opts: { voice: string; language: string }, ssmlInner: string) {
-  // ssmlInner must NOT include <Say> tags, only the <speak>...</speak> part
-  return `<Say voice="${xmlEscape(opts.voice)}" language="${xmlEscape(opts.language)}"><![CDATA[${ssmlInner}]]></Say>`;
-}
-
 
 
 function answerFromKB(kb: any, utterance: string): string | null {
@@ -268,44 +247,16 @@ app.post("/webhooks/twilio/inbound-call", (req: Request<{}, {}, TwilioVoiceBody>
 
   const vr = new twiml.VoiceResponse();
 
-  const greetingSsml = `
-  <speak>
-    <prosody rate="92%" pitch="+1st">Hi there.</prosody>
-    <break time="250ms"/>
-    You’ve reached ${xmlEscape(tenant.businessName)}.
-    <break time="200ms"/>
-    How can I help you today?
-  </speak>`.trim();
-
   // Greeting
-  // saySsml(
-  //   vr,
-  //   `
-  //   <speak>
-  //     <prosody rate="95%" pitch="+1st">
-  //       Hi there.
-  //     </prosody>
-  //     <break time="400ms"/>
-  //     You’ve reached ${tenant.businessName}.
-  //     <break time="300ms"/>
-  //     I’m your virtual receptionist.
-  //     <break time="250ms"/>
-  //     How can I help you today?
-  //   </speak>
-  //   `
-  // );
-
-  const twiml =
-  `<?xml version="1.0" encoding="UTF-8"?>
-  <Response>
-    ${saySsmlRaw({ voice, language: lang }, greetingSsml)}
-    <Gather input="speech" speechTimeout="auto" action="${xmlEscape(actionUrl)}" method="POST"
-            language="en-US" bargeIn="true">
-      <Say voice="${voice}" language="${lang}">Go ahead — I’m listening.</Say>
-    </Gather>
-    <Say voice="${voice}" language="${lang}">Sorry, I didn’t catch that. Goodbye.</Say>
-    <Hangup/>
-  </Response>`;
+  say(
+    vr,
+    `
+    Hi there.
+    You’ve reached ${tenant.businessName}.
+    I’m your virtual receptionist.
+    How can I help you today?
+    `
+  );
   // Gather initial speech
   const action = buildAbsoluteUrl(req, `/webhooks/twilio/handle-speech`);
   gatherSpeech(vr, action, "Please tell me what you need.");
@@ -315,8 +266,7 @@ app.post("/webhooks/twilio/inbound-call", (req: Request<{}, {}, TwilioVoiceBody>
   vr.hangup();
 
 
-  // res.type("text/xml").send(vr.toString());
-  res.type("text/xml").send(twiml);
+  res.type("text/xml").send(vr.toString());
 });
 
 /**
