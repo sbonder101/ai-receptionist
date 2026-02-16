@@ -10,6 +10,7 @@ import { twiml } from "twilio";
 import { validateRequest } from "twilio/lib/webhooks/webhooks";
 import fs from "fs";
 import path from "path";
+import { appendCallLog } from "./googleSheetsLogger";
 
 
 // If you want JSON import: enable resolveJsonModule in tsconfig.
@@ -660,6 +661,27 @@ app.post("/webhooks/twilio/handle-speech", (req: Request<{}, {}, TwilioVoiceBody
       </speak>`
     );
   }
+
+  // log call in google sheets
+  const handoffRegex =
+    /\b(owner|manager|human|agent|representative)\b|speak to (the )?(owner|manager)/i;
+
+  const outcome = handoffRegex.test(speech)
+    ? "handoff"
+    : answer
+    ? "answered"
+    : "fallback";
+
+  appendCallLog({
+    timestamp: new Date().toISOString(),
+    tenantId: tenant.id,
+    callSid,
+    from: req.body.From || "",
+    to: (req.body.To || req.body.Called || "").toString(),
+    speech,
+    confidence,
+    outcome,
+  }).catch((e) => req.log.error({ e }, "Failed to append call log to Google Sheets"));
 
   // Continue conversation (cap turns to avoid endless loop)
   if (session.turns >= 4) {
