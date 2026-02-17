@@ -388,6 +388,23 @@ function tokenize(s: string) {
     .filter(Boolean);
 }
 
+function sayWithPauses(
+  vr: any,
+  opts: { voice?: string; language?: string },
+  parts: Array<string | { breakMs: number } | { emphasis: string }>
+) {
+  const say = vr.say(opts);
+  for (const p of parts) {
+    if (typeof p === "string") {
+      if (p.trim()) say.addText(p);
+    } else if ("breakMs" in p) {
+      say.break({ time: `${p.breakMs}ms` });
+    } else if ("emphasis" in p) {
+      say.emphasis({ level: "moderate" }, p.emphasis);
+    }
+  }
+}
+
 function bestFaqAnswer(kb: KnowledgeBase, utterance: string): string | null {
   const faqs = kb.faqs || [];
   if (!faqs.length) return null;
@@ -877,20 +894,38 @@ async function handleBookingTurn(args: {
       typeof b.priceZar === "number" ? `Cost: ${zarToWords(b.priceZar)}.` : "";
 
     // IMPORTANT: Only escape interpolated values, not SSML tags.
-    saySsml(
-      vr,
-      `<speak>
-        Just to confirm:
-        <break time="150ms"/>
-        ${escapeForSsml(b.serviceName || "the service")},
-        for ${escapeForSsml(b.customerName || "")},
-        on ${escapeForSsml(whenLocal)}.
-        <break time="150ms"/>
-        ${escapeForSsml(priceLine)}
-        <break time="200ms"/>
-        Say <emphasis>yes</emphasis> to confirm, or <emphasis>no</emphasis> to change the time.
-      </speak>`
-    );
+    // saySsml(
+    //   vr,
+    //   `<speak>
+    //     Just to confirm:
+    //     <break time="150ms"/>
+    //     ${escapeForSsml(b.serviceName || "the service")},
+    //     for ${escapeForSsml(b.customerName || "")},
+    //     on ${escapeForSsml(whenLocal)}.
+    //     <break time="150ms"/>
+    //     ${escapeForSsml(priceLine)}
+    //     <break time="200ms"/>
+    //     Say <emphasis>yes</emphasis> to confirm, or <emphasis>no</emphasis> to change the time.
+    //   </speak>`
+    // );
+
+    sayWithPauses(vr, {}, [
+      "Just to confirm.",
+      { breakMs: 150 },
+      `${b.serviceName},`,
+      { breakMs: 150 },
+      `for ${b.customerName},`,
+      { breakMs: 150 },
+      `on ${whenLocal} .`,
+      { breakMs: 150 },
+      `will cost: ${priceLine}.`,
+      { breakMs: 200 },
+      "Say ",
+      { emphasis: "yes" },
+      " to confirm, or ",
+      { emphasis: "no" },
+      " to change the time."
+    ]); 
 
     const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
     gatherInput(vr, action, "Go ahead.", { bargeIn: true, hints: ["yes", "no", "confirm", "change"] });
