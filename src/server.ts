@@ -25,6 +25,7 @@ import { validateRequest } from "twilio/lib/webhooks/webhooks";
 import fs from "fs";
 import path from "path";
 import { appendCallLog, appendBookingLog } from "./googleSheetsLogger";
+import { createBookingEvent } from "./googleCalendar";
 
 dotenv.config();
 
@@ -79,6 +80,7 @@ type Tenant = {
   hours?: HoursSpec;
   handoffNumber?: string;
   knowledgeBaseId: string;
+  calendarId?: string; // NEW
 };
 
 type KBService = {
@@ -753,29 +755,81 @@ async function handleBookingTurn(args: {
       return endWithNextPrompt(res, vr, tenant.id);
     }
 
-    // CONFIRMED
-    b.stage = "done";
+    // Confirmed booking → check calendar + create event
+    const svc = (kb.services || []).find((s) => s.id === b.serviceId) ?? null;
+    const durationMin = svc?.durationMin ?? 30;
 
-    // Booking sheet row
-    try {
-      const svc = (kb.services || []).find((s) => s.id === b.serviceId) ?? null;
-      const durationMin = svc?.durationMin ?? 30;
+    const timezone = kb.timezone || tenant.timezone || "Africa/Johannesburg";
+    const calendarId = tenant.calendarId;
 
-      await appendBookingLog({
-        timestamp: new Date().toISOString(),
-        tenantId: tenant.id,
-        callSid: session.callSid,
-        name: "",
-        phone: session.from,
-        service: b.serviceName ?? "",
-        startTime: b.startIso ?? "",
-        durationMin,
-        status: "confirmed",
-        notes: "confirmed via voice",
-      });
-    } catch (e) {
-      req.log.error({ e }, "appendBookingLog failed");
+    if (!calendarId) {
+      // Calendar not configured, fallback to Sheets only
+      req.log.warn({ tenantId: tenant.id }, "No calendarId configured; skipping calendar insert");
+    } else {
+      try {
+        const calResult = await createBookingEvent({
+          calendarId,
+          tenantId: tenant.id,
+          callSid: session.callSid,
+          serviceName: b.serviceName ?? "Booking",
+          customerPhone: session.from,
+          startIsoUtc: b.startIso ?? "",
+          durationMin,
+          timezone,
+        });
+
+        if (!calResult.ok && calResult.reason === "busy") {
+          // Slot already taken — manual event or another booking
+          b.stage = "need_datetime";
+          saySsml(vr, `<speak>
+            Sorry, that time is already booked.
+            <break time="150ms"/>
+            Please tell me another day and time.
+          </speak>`);
+          return endWithNextPrompt(res, vr, tenant.id);
+        }
+
+        if (!calResult.ok) {
+          req.log.error({ calResult }, "Calendar insert failed");
+          // We can still proceed, but better to be honest:
+          saySsml(vr, `<speak>
+            I’m having trouble confirming on the calendar right now.
+            <break time="150ms"/>
+            Please try another time, or I can connect you to the owner.
+          </speak>`);
+          b.stage = "need_datetime";
+          return endWithNextPrompt(res, vr, tenant.id);
+        }
+
+        // Optional: store eventId in booking notes for auditing
+        // b.calendarEventId = calResult.eventId
+      } catch (e) {
+        req.log.error({ e }, "Calendar createBookingEvent threw");
+        b.stage = "need_datetime";
+        saySsml(vr, `<speak>
+          I couldn’t confirm that slot right now.
+          <break time="150ms"/>
+          Please tell me another day and time.
+        </speak>`);
+        return endWithNextPrompt(res, vr, tenant.id);
+      }
     }
+
+    // If calendar succeeded (or calendarId missing), now log to Sheets:
+    await appendBookingLog({
+      timestamp: new Date().toISOString(),
+      tenantId: tenant.id,
+      callSid: session.callSid,
+      name: "",
+      phone: session.from,
+      service: b.serviceName ?? "",
+      startTime: b.startIso ?? "",
+      durationMin,
+      status: "confirmed",
+      notes: "confirmed via voice",
+    });
+
+    b.stage = "done";
 
     // Call log outcome
     appendCallLog({
@@ -792,6 +846,7 @@ async function handleBookingTurn(args: {
     saySsml(vr, `<speak>Perfect. You’re booked. We’ll see you then. Goodbye.</speak>`);
     vr.hangup();
     return res.type("text/xml").send(vr.toString());
+
   }
 
   // Safety fallback
