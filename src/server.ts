@@ -55,6 +55,11 @@ type TtsLang = "en-US" | "en-GB";
 const TTS_VOICE: TtsVoice = pickVoice(process.env.TTS_VOICE);
 const TTS_LANG: TtsLang = pickLang(process.env.TTS_LANG);
 
+const SAY_OPTS = {
+  voice: TTS_VOICE,
+  language: TTS_LANG,
+};
+
 // Speech tuning
 const MIN_CONFIDENCE = Number(process.env.MIN_SPEECH_CONFIDENCE || 0.55);
 const MAX_TURNS = Number(process.env.MAX_CALL_TURNS || 8);
@@ -386,6 +391,26 @@ function tokenize(s: string) {
     .replace(/[^a-z0-9\s]/g, " ")
     .split(/\s+/)
     .filter(Boolean);
+}
+
+// gatherName
+
+function gatherName(twiml: any, actionUrl: string) {
+  const hints = process.env.NAME_HINTS || "Karabo,Sboniso,Thabo,Lerato";
+  const g = twiml.gather({
+    input: "speech",
+    speechTimeout: "auto",
+    action: actionUrl,
+    method: "POST",
+    language: SAY_OPTS.language,
+    enhanced: true,
+    speechModel: "phone_call",
+    hints,
+  });
+
+  // Prompt inside gather
+  // Note: Twilio helper has gather.say(); use the SAME voice here
+  g.say({ voice: SAY_OPTS.voice, language: SAY_OPTS.language }, "Please tell me your first name.");
 }
 
 function sayWithPauses(
@@ -766,7 +791,7 @@ async function handleBookingTurn(args: {
     );
 
     const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
-    gatherInput(vr, action, "Say your name.", { bargeIn: true });
+    gatherInput(vr, action, "Say your name.", { bargeIn: true, hints: (process.env.NAME_HINTS || "").split(",").map(s => s.trim()).filter(Boolean), });
     sayText(vr, "Goodbye.");
     return hangup(res, vr);
   }
@@ -909,7 +934,7 @@ async function handleBookingTurn(args: {
     //   </speak>`
     // );
 
-    sayWithPauses(vr, {}, [
+    sayWithPauses(vr, {voice: TTS_VOICE, language: TTS_LANG}, [
       "Just to confirm.",
       { breakMs: 150 },
       `${b.serviceName},`,
@@ -1023,7 +1048,8 @@ async function handleBookingTurn(args: {
     } catch (e) {
       req.log.error({ e }, "appendBookingLog failed");
     }
-
+    // log 
+    req.log.info({ calendarId, start: b.startIsoUtc, end: b.endIsoUtc }, "Attempting calendar insert");
     // 2) Calendar event (only if configured)
     if (calendarId && b.startIsoUtc && b.endIsoUtc) {
       try {
