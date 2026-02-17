@@ -1,27 +1,13 @@
 /**
  * server.ts — AI Receptionist (Twilio Voice) + KB + Booking + Google Sheets + Google Calendar
  *
- * Key upgrades:
- * - Robust gatherInput(): speech + dtmf, enhanced model, confidence gating
- * - Reprompt limits + DTMF menu fallback (prevents endless loops)
- * - Booking flow: service -> (speak price) -> datetime -> name -> confirm
- * - Calendar: checks freebusy to prevent double booking, creates event on confirm
- * - Pricing: speaks "twenty rand" instead of "R20"
- *
- * ENV (minimum):
- * - PUBLIC_BASE_URL=https://<your-render-app>.onrender.com
- * - TWILIO_VALIDATE_SIGNATURE=true|false
- * - TWILIO_AUTH_TOKEN=...
- * - GSHEETS_SPREADSHEET_ID=...
- * - GOOGLE_CLIENT_EMAIL=...
- * - GOOGLE_PRIVATE_KEY=... (with \n escaped)
- *
- * Calendar ENV:
- * - GOOGLE_CALENDAR_ID=primary OR a calendar id (recommended: dedicated calendar per tenant)
- * - (Optional) GOOGLE_CALENDAR_TIMEZONE=Africa/Johannesburg
- *
- * Notes:
- * - For service account calendars: share the calendar with the service-account email with "Make changes to events".
+ * Fixes included:
+ * - gatherInput (speech + dtmf) with enhanced phone_call model + hints
+ * - Confidence-aware reprompts (don't progress state on low confidence)
+ * - Price spoken as words ("twenty rand") instead of "R20"
+ * - Booking flow stages: need_service -> need_name -> need_datetime -> confirm
+ * - Calendar availability check + next available suggestion if busy
+ * - End call after confirmed booking (no random "anything else")
  */
 
 import express from "express";
@@ -47,7 +33,7 @@ const app = express();
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
 /** -------------------------
- *  ENV + CONSTANTS
+ *  ENV
  * ------------------------- */
 const PORT = Number(process.env.PORT || 3000);
 
@@ -62,36 +48,43 @@ const PUBLIC_BASE_URL = normalizeBaseUrl(
   process.env.PUBLIC_BASE_URL || process.env.BASE_URL || ""
 );
 
+const DEFAULT_CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || ""; // can also be per-tenant
+
 type TtsVoice = "alice" | "Polly.Amy-Neural";
 type TtsLang = "en-US" | "en-GB";
 const TTS_VOICE: TtsVoice = pickVoice(process.env.TTS_VOICE);
 const TTS_LANG: TtsLang = pickLang(process.env.TTS_LANG);
 
+// Speech tuning
+const MIN_CONFIDENCE = Number(process.env.MIN_SPEECH_CONFIDENCE || 0.55);
+const MAX_TURNS = Number(process.env.MAX_CALL_TURNS || 8);
+
+/** -------------------------
+ *  DATA PATHS
+ * ------------------------- */
 const DATA_DIR = path.join(process.cwd(), "data");
 const TENANTS_FILE = path.join(DATA_DIR, "tenants.json");
 const CALLS_LOG_FILE = path.join(DATA_DIR, "calls.csv");
 
-const MIN_CONFIDENCE = Number(process.env.MIN_CONFIDENCE ?? 0.45);
-const MAX_TURNS = Number(process.env.MAX_TURNS ?? 8);
-const MAX_REPROMPTS = Number(process.env.MAX_REPROMPTS ?? 2);
-
-// Keep follow-up prompt minimal to avoid “random” feel.
-const FOLLOWUP_PROMPT = process.env.FOLLOWUP_PROMPT || "Go ahead.";
-
 /** -------------------------
  *  TYPES
  * ------------------------- */
-type HoursSpec = { [day: string]: { open: string; close: string } | undefined };
+type HoursSpec = {
+  // 0=Sun..6=Sat
+  [day: string]: { open: string; close: string } | undefined;
+};
 
 type Tenant = {
   id: string;
   businessName: string;
-  twilioNumber: string;
-  timezone?: string; // e.g. Africa/Johannesburg
+  twilioNumber: string; // +27...
+  timezone?: string; // "Africa/Johannesburg"
   hours?: HoursSpec;
   handoffNumber?: string;
   knowledgeBaseId: string;
-  calendarId?: string; // per-tenant calendar override (recommended)
+
+  // Calendar: prefer per-tenant, fallback to env GOOGLE_CALENDAR_ID
+  calendarId?: string;
 };
 
 type KBService = {
@@ -104,16 +97,15 @@ type KBService = {
 
 type KBBooking = {
   enabled?: boolean;
-  slotSizeMin: number;
-  bufferMin?: number;
-  sameDayCutoffTime?: string; // "16:00"
-  leadTimeMin?: number; // e.g. 30
-  maxDaysAhead?: number; // e.g. 30
+  leadTimeMin?: number;
+  maxDaysAhead?: number;
+  slotStepMin?: number; // step size to find next availability (e.g. 15)
+  lookAheadDays?: number; // e.g. 14
 };
 
 type KnowledgeBase = {
   businessName?: string;
-  timezone?: string;
+  timezone?: string; // "Africa/Johannesburg"
   address?: string;
   handoffNumber?: string;
   services?: KBService[];
@@ -130,6 +122,7 @@ type TwilioVoiceBody = {
   SpeechResult?: string;
   Confidence?: string;
   Digits?: string;
+  CallStatus?: string;
 };
 
 type Intent = "HANDOFF" | "PRICING" | "HOURS" | "ADDRESS" | "BOOKING" | "POLICY" | "OTHER";
@@ -137,20 +130,30 @@ type Intent = "HANDOFF" | "PRICING" | "HOURS" | "ADDRESS" | "BOOKING" | "POLICY"
 type BookingStage =
   | "idle"
   | "need_service"
-  | "need_datetime"
   | "need_name"
+  | "need_datetime"
   | "confirm"
+  | "suggest_alt"
   | "done";
 
 type BookingState = {
   stage: BookingStage;
-  reprompts: number;
   serviceId?: string;
   serviceName?: string;
   priceZar?: number;
   durationMin?: number;
-  startIso?: string;  // ISO in UTC
-  name?: string;
+
+  customerName?: string;
+  startIsoUtc?: string; // UTC ISO
+  endIsoUtc?: string;   // UTC ISO
+
+  // if chosen time is busy
+  suggestedStartIsoUtc?: string;
+  suggestedEndIsoUtc?: string;
+
+  // reprompt guard
+  lastPromptKey?: string;
+  lowConfidenceCount?: number;
 };
 
 type CallSession = {
@@ -160,16 +163,22 @@ type CallSession = {
   to: string;
   createdAt: number;
   turns: number;
-  reprompts: number;
   booking: BookingState;
 };
+
+function pickLang(v?: string): TtsLang {
+  return v === "en-US" ? "en-US" : "en-GB";
+}
+function pickVoice(v?: string): TtsVoice {
+  return v === "Polly.Amy-Neural" ? "Polly.Amy-Neural" : "alice";
+}
 
 /** -------------------------
  *  MIDDLEWARE
  * ------------------------- */
 app.set("trust proxy", 1);
 app.use(helmet());
-app.use(express.urlencoded({ extended: false })); // Twilio form urlencoded
+app.use(express.urlencoded({ extended: false }));
 
 app.use((req: Request, res: Response, next: NextFunction) => {
   const existing = req.header("x-request-id");
@@ -219,9 +228,10 @@ function buildAbsoluteUrl(pathname: string, query?: Record<string, string | unde
 }
 
 function twilioSignatureOk(req: Request): boolean {
-  if (ALLOW_TEST_BYPASS && TEST_BYPASS_KEY && req.header("x-test-bypass") === TEST_BYPASS_KEY) return true;
+  if (ALLOW_TEST_BYPASS && TEST_BYPASS_KEY && req.header("x-test-bypass") === TEST_BYPASS_KEY) {
+    return true;
+  }
   if (!TWILIO_VALIDATE_SIGNATURE) return true;
-
   if (!TWILIO_AUTH_TOKEN) {
     req.log.error("TWILIO_VALIDATE_SIGNATURE=true but TWILIO_AUTH_TOKEN missing");
     return false;
@@ -230,16 +240,6 @@ function twilioSignatureOk(req: Request): boolean {
   const signature = req.header("x-twilio-signature") || "";
   const url = getPublicUrl(req);
   return validateRequest(TWILIO_AUTH_TOKEN, signature, url, req.body);
-}
-
-/** -------------------------
- *  VOICE SETTINGS
- * ------------------------- */
-function pickLang(v?: string): TtsLang {
-  return v === "en-US" ? "en-US" : "en-GB";
-}
-function pickVoice(v?: string): TtsVoice {
-  return v === "Polly.Amy-Neural" ? "Polly.Amy-Neural" : "alice";
 }
 
 /** -------------------------
@@ -280,6 +280,7 @@ const kbCache = new Map<string, KBCacheEntry>();
 function kbPath(knowledgeBaseId: string) {
   return path.join(DATA_DIR, `${knowledgeBaseId}.json`);
 }
+
 function loadKnowledgeBase(knowledgeBaseId: string): KnowledgeBase {
   const file = kbPath(knowledgeBaseId);
   const st = fs.statSync(file);
@@ -308,8 +309,7 @@ function getSession(callSid: string, tenant: Tenant, from: string, to: string): 
     to,
     createdAt: Date.now(),
     turns: 0,
-    reprompts: 0,
-    booking: { stage: "idle", reprompts: 0 },
+    booking: { stage: "idle", lowConfidenceCount: 0 },
   };
   sessions.set(callSid, s);
   return s;
@@ -328,11 +328,13 @@ function ensureCallsCsvHeader() {
     );
   }
 }
+
 function csvEscape(v: string) {
   const s = (v ?? "").toString();
   if (/[,"\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;
 }
+
 function logCallTurn(params: {
   tenantId: string;
   callSid: string;
@@ -414,74 +416,10 @@ function bestFaqAnswer(kb: KnowledgeBase, utterance: string): string | null {
 }
 
 /** -------------------------
- *  MONEY SPEECH: “twenty rand”
- * ------------------------- */
-function numberToWords(n: number): string {
-  // good enough for pricing up to 9999
-  const ones = [
-    "zero","one","two","three","four","five","six","seven","eight","nine",
-    "ten","eleven","twelve","thirteen","fourteen","fifteen","sixteen","seventeen","eighteen","nineteen",
-  ];
-  const tens = ["","","twenty","thirty","forty","fifty","sixty","seventy","eighty","ninety"];
-
-  if (n < 20) return ones[n];
-  if (n < 100) {
-    const t = Math.floor(n / 10);
-    const o = n % 10;
-    return o ? `${tens[t]} ${ones[o]}` : tens[t];
-  }
-  if (n < 1000) {
-    const h = Math.floor(n / 100);
-    const r = n % 100;
-    return r ? `${ones[h]} hundred ${numberToWords(r)}` : `${ones[h]} hundred`;
-  }
-  if (n < 10000) {
-    const th = Math.floor(n / 1000);
-    const r = n % 1000;
-    return r ? `${ones[th]} thousand ${numberToWords(r)}` : `${ones[th]} thousand`;
-  }
-  return String(n);
-}
-
-function moneyZarToSpeech(amount: number): string {
-  const rounded = Math.round(amount * 100) / 100;
-  const rands = Math.floor(rounded);
-  const cents = Math.round((rounded - rands) * 100);
-
-  const randPart = `${numberToWords(rands)} ${rands === 1 ? "rand" : "rand"}`;
-  if (!cents) return randPart;
-  return `${randPart} and ${numberToWords(cents)} cents`;
-}
-
-/** -------------------------
- *  PRICING RESPONSE (SSML)
- * ------------------------- */
-function formatPricesSsml(services?: KBService[]) {
-  const list = services || [];
-  if (!list.length) {
-    return `<speak>I don’t have the latest pricing yet. Would you like me to connect you to the owner?</speak>`;
-  }
-
-  const parts = list.map((s) => {
-    const name = escapeForSsml(s.name || "Service");
-    const dur = typeof s.durationMin === "number" ? `${s.durationMin} minutes` : "";
-    const price =
-      typeof s.priceZar === "number"
-        ? moneyZarToSpeech(s.priceZar)
-        : "price on request";
-    return `${name}: ${escapeForSsml(price)}${dur ? `, ${dur}` : ""}`;
-  });
-
-  // SSML with pauses so it sounds natural
-  return `<speak>${parts.join(". <break time='200ms'/> ")}.</speak>`;
-}
-
-/** -------------------------
- *  HOURS (simple tenant hours)
+ *  HOURS (tenant simple)
  * ------------------------- */
 function isOpenNow(tenant: Tenant, now = new Date()): boolean | null {
   if (!tenant.hours) return null;
-
   const day = now.getDay().toString();
   const spec = tenant.hours[day];
   if (!spec) return false;
@@ -493,6 +431,7 @@ function isOpenNow(tenant: Tenant, now = new Date()): boolean | null {
   const mins = now.getHours() * 60 + now.getMinutes();
   const openMins = oh * 60 + om;
   const closeMins = ch * 60 + cm;
+
   return mins >= openMins && mins <= closeMins;
 }
 
@@ -503,7 +442,11 @@ function toPlainString(x: unknown): string {
   if (x === null || x === undefined) return "";
   if (typeof x === "string") return x;
   if (typeof x === "number" || typeof x === "boolean") return String(x);
-  try { return JSON.stringify(x); } catch { return String(x); }
+  try {
+    return JSON.stringify(x);
+  } catch {
+    return String(x);
+  }
 }
 
 function sayText(vr: twiml.VoiceResponse, text: unknown) {
@@ -515,44 +458,15 @@ function sayText(vr: twiml.VoiceResponse, text: unknown) {
 function saySsml(vr: twiml.VoiceResponse, ssml: string) {
   const clean = (ssml || "").trim();
   if (!clean) return;
+  // Provide <speak>...</speak> as body (NO ssml attr)
   vr.say({ voice: TTS_VOICE, language: TTS_LANG } as any, clean);
 }
 
-function menuPromptSsml() {
-  return `<speak>
-    You can also use the keypad.
-    <break time="150ms"/>
-    Press 1 for bookings.
-    <break time="100ms"/>
-    Press 2 for prices.
-    <break time="100ms"/>
-    Press 3 for business hours.
-    <break time="100ms"/>
-    Press 4 for the address.
-    <break time="100ms"/>
-    Press 0 to speak to the owner.
-  </speak>`;
-}
-
-function digitsToIntent(digits?: string): Intent | null {
-  const d = (digits || "").trim();
-  if (d === "1") return "BOOKING";
-  if (d === "2") return "PRICING";
-  if (d === "3") return "HOURS";
-  if (d === "4") return "ADDRESS";
-  if (d === "0") return "HANDOFF";
-  return null;
-}
-
-/**
- * gatherInput: speech + dtmf, enhanced speech settings.
- * - If caller struggles, they can press a key.
- */
 function gatherInput(
   vr: twiml.VoiceResponse,
   actionUrl: string,
-  prompt: string,
-  opts?: { bargeIn?: boolean; numDigits?: number }
+  promptText: string,
+  opts?: { bargeIn?: boolean; hints?: string[] }
 ) {
   const gather = vr.gather({
     input: ["speech", "dtmf"],
@@ -561,37 +475,63 @@ function gatherInput(
     method: "POST",
     language: TTS_LANG,
     bargeIn: opts?.bargeIn ?? true,
-    numDigits: opts?.numDigits,
+
+    // Speech quality improvements:
     enhanced: true,
     speechModel: "phone_call",
+
+    // Helps recognizer lock onto domain terms (Twilio supports "hints")
+    hints: opts?.hints?.slice(0, 20),
   } as any);
 
-  // prompt can be SSML or plain text; keep it simple
-  if (prompt.trim().startsWith("<speak>")) gather.say({ voice: TTS_VOICE, language: TTS_LANG } as any, prompt.trim());
-  else gather.say({ voice: TTS_VOICE, language: TTS_LANG } as any, prompt.trim());
+  gather.say({ voice: TTS_VOICE, language: TTS_LANG } as any, promptText.trim());
 }
 
-/**
- * End-of-turn helper:
- * - keeps the follow-up prompt minimal (not “Anything else…”)
- * - adds DTMF menu if repeated reprompts
- */
-function endWithNextPrompt(res: Response, vr: twiml.VoiceResponse, tenantId: string, includeMenu = false) {
-  const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId });
-
-  if (includeMenu) {
-    gatherInput(vr, action, menuPromptSsml(), { numDigits: 1 });
-  } else {
-    gatherInput(vr, action, FOLLOWUP_PROMPT, { bargeIn: true });
-  }
-
-  saySsml(vr, `<speak>Sorry, I didn’t catch that. Goodbye.</speak>`);
+function hangup(res: Response, vr: twiml.VoiceResponse) {
   vr.hangup();
   return res.type("text/xml").send(vr.toString());
 }
 
 /** -------------------------
- *  BOOKING PARSING
+ *  PRICE TO WORDS (ZAR)
+ * ------------------------- */
+const ONES = [
+  "zero","one","two","three","four","five","six","seven","eight","nine","ten",
+  "eleven","twelve","thirteen","fourteen","fifteen","sixteen","seventeen","eighteen","nineteen"
+];
+const TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"];
+
+function intToWords(n: number): string {
+  n = Math.floor(Math.abs(n));
+  if (n < 20) return ONES[n];
+  if (n < 100) {
+    const t = Math.floor(n / 10);
+    const r = n % 10;
+    return r ? `${TENS[t]} ${ONES[r]}` : TENS[t];
+  }
+  if (n < 1000) {
+    const h = Math.floor(n / 100);
+    const r = n % 100;
+    return r ? `${ONES[h]} hundred ${intToWords(r)}` : `${ONES[h]} hundred`;
+  }
+  if (n < 1_000_000) {
+    const th = Math.floor(n / 1000);
+    const r = n % 1000;
+    return r ? `${intToWords(th)} thousand ${intToWords(r)}` : `${intToWords(th)} thousand`;
+  }
+  return String(n);
+}
+
+function zarToWords(amount: number): string {
+  const rands = Math.floor(amount);
+  const cents = Math.round((amount - rands) * 100);
+  const randWords = `${intToWords(rands)} rand${rands === 1 ? "" : ""}`; // SA usage often "rand" for plural too
+  if (!cents) return randWords;
+  return `${randWords} and ${intToWords(cents)} cent${cents === 1 ? "" : "s"}`;
+}
+
+/** -------------------------
+ *  SERVICES / BOOKING PARSING
  * ------------------------- */
 function normalizeText(s: string) {
   return (s || "").toLowerCase().replace(/\s+/g, " ").trim();
@@ -619,67 +559,67 @@ function parseTimeTo24h(t: string): { hh: number; mm: number } | null {
   if (Number.isNaN(hh) || Number.isNaN(mm)) return null;
   if (mm < 0 || mm > 59) return null;
 
-  if (ap === "am") { if (hh === 12) hh = 0; }
-  else if (ap === "pm") { if (hh < 12) hh += 12; }
-
+  if (ap === "am") {
+    if (hh === 12) hh = 0;
+  } else if (ap === "pm") {
+    if (hh < 12) hh += 12;
+  }
   if (hh < 0 || hh > 23) return null;
+
   return { hh, mm };
 }
 
-function nextWeekday(base: Date, targetDow: number) {
-  const d = new Date(base);
-  const diff = (targetDow + 7 - d.getDay()) % 7 || 7;
-  d.setDate(d.getDate() + diff);
-  return d;
+function nextWeekday(base: DateTime, targetDow: number) {
+  // Luxon weekday: Monday=1..Sunday=7; JS dow in your earlier code was 0..6.
+  // We'll use Luxon weekday for correctness.
+  const baseDow = base.weekday; // 1..7
+  const diff = (targetDow - baseDow + 7) % 7 || 7;
+  return base.plus({ days: diff });
 }
 
-/**
- * Parse day+time into UTC ISO, using tenant/kb timezone (Luxon).
- */
-function parseBookingDateTimeUtcIso(speech: string, tz: string): string | null {
+function parseBookingDateTimeToUtcIso(speech: string, timeZone: string): { startIsoUtc: string } | null {
   const t = normalizeText(speech);
 
-  const now = DateTime.now().setZone(tz);
+  const nowLocal = DateTime.now().setZone(timeZone);
+  let dateLocal: DateTime | null = null;
 
+  // Luxon weekday mapping: mon=1..sun=7
   const dowMap: Record<string, number> = {
-    sunday: 7, sun: 7,
     monday: 1, mon: 1,
     tuesday: 2, tue: 2, tues: 2,
     wednesday: 3, wed: 3,
     thursday: 4, thu: 4, thur: 4, thurs: 4,
     friday: 5, fri: 5,
     saturday: 6, sat: 6,
+    sunday: 7, sun: 7,
   };
 
-  let date = now;
-  let hasDate = false;
-
-  if (/\btoday\b/.test(t)) { date = now; hasDate = true; }
-  else if (/\btomorrow\b/.test(t)) { date = now.plus({ days: 1 }); hasDate = true; }
-  else {
+  if (/\btoday\b/.test(t)) {
+    dateLocal = nowLocal;
+  } else if (/\btomorrow\b/.test(t)) {
+    dateLocal = nowLocal.plus({ days: 1 });
+  } else {
     for (const [k, v] of Object.entries(dowMap)) {
       if (new RegExp(`\\b${k}\\b`).test(t)) {
-        // next occurrence
-        const curIsoWeekday = now.weekday; // 1..7
-        let diff = (v - curIsoWeekday + 7) % 7;
-        if (diff === 0) diff = 7;
-        date = now.plus({ days: diff });
-        hasDate = true;
+        dateLocal = nextWeekday(nowLocal, v);
         break;
       }
     }
   }
 
   const time = parseTimeTo24h(t);
-  if (!hasDate || !time) return null;
+  if (!dateLocal || !time) return null;
 
-  const dt = date.set({ hour: time.hh, minute: time.mm, second: 0, millisecond: 0 });
-  return dt.toUTC().toISO() ?? null;
+  const dtLocal = dateLocal.set({ hour: time.hh, minute: time.mm, second: 0, millisecond: 0 });
+  const dtUtc = dtLocal.toUTC();
+
+  return { startIsoUtc: dtUtc.toISO()! };
 }
 
-function humanizeIsoInTz(isoUtc: string, tz: string) {
-  const d = DateTime.fromISO(isoUtc, { zone: "utc" }).setZone(tz);
-  return d.toLocaleString(DateTime.DATETIME_FULL); // “Friday, 21 February 2026 at 09:00”
+function humanizeUtcIsoToLocal(isoUtc: string, timeZone: string) {
+  return DateTime.fromISO(isoUtc, { zone: "utc" })
+    .setZone(timeZone)
+    .toLocaleString(DateTime.DATETIME_FULL);
 }
 
 function isBookingEnabled(kb: KnowledgeBase): boolean {
@@ -688,16 +628,34 @@ function isBookingEnabled(kb: KnowledgeBase): boolean {
   return true;
 }
 
-function cleanNameFromSpeech(s: string): string {
-  // Keep it simple and safe
-  const t = (s || "").trim();
-  if (!t) return "";
-  // strip common filler
-  return t.replace(/\b(my name is|this is|it is)\b/ig, "").trim();
+function shouldRepromptForConfidence(confidence?: number, speech?: string) {
+  const txt = (speech || "").trim();
+  if (!txt) return true;
+  if (confidence === undefined) return false; // some Twilio configs omit it
+  return confidence < MIN_CONFIDENCE;
 }
 
 /** -------------------------
- *  BOOKING FLOW
+ *  FORMAT PRICES (speech-friendly)
+ * ------------------------- */
+function formatPricesSpeechFriendly(services?: KnowledgeBase["services"]) {
+  const list = services || [];
+  if (!list.length) return "I don’t have the latest pricing yet. Would you like me to connect you to the owner?";
+
+  return list
+    .map((s) => {
+      const name = s.name || "Service";
+      const dur = typeof s.durationMin === "number" ? `, about ${s.durationMin} minutes` : "";
+      if (typeof s.priceZar === "number") {
+        return `${name}: ${zarToWords(s.priceZar)}${dur}`;
+      }
+      return `${name}: price on request${dur}`;
+    })
+    .join(". ");
+}
+
+/** -------------------------
+ *  BOOKING TURN HANDLER
  * ------------------------- */
 async function handleBookingTurn(args: {
   req: Request;
@@ -709,275 +667,385 @@ async function handleBookingTurn(args: {
   speech: string;
   confidence?: number;
 }) {
-  const { req, res, vr, tenant, kb, session, speech } = args;
-
-  if (!isBookingEnabled(kb)) {
-    saySsml(vr, `<speak>Bookings are not available right now. Would you like prices, hours, or the address?</speak>`);
-    return endWithNextPrompt(res, vr, tenant.id);
-  }
-
-  const tz = kb.timezone || tenant.timezone || process.env.GOOGLE_CALENDAR_TIMEZONE || "Africa/Johannesburg";
+  const { req, res, vr, tenant, kb, session, speech, confidence } = args;
   const b = session.booking;
 
-  // Start booking if idle/done
-  if (b.stage === "idle" || b.stage === "done") {
-    session.booking = { stage: "need_service", reprompts: 0 };
+  const timeZone = kb.timezone || tenant.timezone || "Africa/Johannesburg";
+  const calendarId = tenant.calendarId || DEFAULT_CALENDAR_ID;
+
+  const serviceHints = (kb.services || []).flatMap((s) => [s.name, ...(s.keywords || [])]).filter(Boolean);
+
+  // Confidence guard: do not progress state, reprompt nicely.
+  if (shouldRepromptForConfidence(confidence, speech)) {
+    b.lowConfidenceCount = (b.lowConfidenceCount || 0) + 1;
+
+    if (b.lowConfidenceCount >= 2) {
+      saySsml(
+        vr,
+        `<speak>
+          Sorry, the line is not very clear.
+          <break time="150ms"/>
+          Please say it slowly, or you can press keys.
+        </speak>`
+      );
+    } else {
+      sayText(vr, "Sorry, I didn’t catch that. Please repeat.");
+    }
+
+    const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
+    gatherInput(vr, action, "Go ahead.", { bargeIn: true, hints: serviceHints });
+    sayText(vr, "Goodbye.");
+    return hangup(res, vr);
   }
 
-  // Stage: need service
-  if (session.booking.stage === "need_service") {
+  // reset low confidence count on good input
+  b.lowConfidenceCount = 0;
+
+  if (!isBookingEnabled(kb)) {
+    sayText(vr, "Bookings are not available right now. Would you like the address or business hours?");
+    const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
+    gatherInput(vr, action, "Go ahead.", { bargeIn: true });
+    sayText(vr, "Goodbye.");
+    return hangup(res, vr);
+  }
+
+  // Stage machine
+  if (b.stage === "need_service") {
     const svc = findService(kb, speech);
     if (!svc) {
-      b.reprompts++;
-      const includeMenu = b.reprompts > MAX_REPROMPTS;
-      saySsml(vr, `<speak>Sure. What would you like to book? For example: haircut, fade, or beard trim.</speak>`);
-      return endWithNextPrompt(res, vr, tenant.id, includeMenu);
+      saySsml(
+        vr,
+        `<speak>
+          Sure. What would you like to book?
+          <break time="150ms"/>
+          For example: haircut, fade, or beard trim.
+        </speak>`
+      );
+
+      const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
+      gatherInput(vr, action, "Go ahead.", { bargeIn: true, hints: serviceHints });
+      sayText(vr, "Goodbye.");
+      return hangup(res, vr);
     }
 
     b.serviceId = svc.id;
     b.serviceName = svc.name;
     b.priceZar = svc.priceZar;
     b.durationMin = svc.durationMin;
-    b.stage = "need_datetime";
-    b.reprompts = 0;
 
-    // Speak price naturally
+    // Immediately speak price properly (key ask from you)
     const priceLine =
-      typeof svc.priceZar === "number"
-        ? `That will cost ${moneyZarToSpeech(svc.priceZar)}.`
-        : `Price is on request.`;
+      typeof svc.priceZar === "number" ? `That will cost ${zarToWords(svc.priceZar)}.` : "Price is on request.";
+
+    b.stage = "need_name";
 
     saySsml(
       vr,
       `<speak>
-        Great. For a ${escapeForSsml(svc.name)}.
+        Great. ${escapeForSsml(priceLine)}
         <break time="150ms"/>
-        ${escapeForSsml(priceLine)}
-        <break time="200ms"/>
-        What day and time would you like?
-        <break time="150ms"/>
-        For example, Friday at 9 a.m.
+        Who is the booking for? Please say your name.
       </speak>`
     );
-    return endWithNextPrompt(res, vr, tenant.id);
+
+    const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
+    gatherInput(vr, action, "Say your name.", { bargeIn: true });
+    sayText(vr, "Goodbye.");
+    return hangup(res, vr);
   }
 
-  // Stage: need datetime
-  if (session.booking.stage === "need_datetime") {
-    const startIsoUtc = parseBookingDateTimeUtcIso(speech, tz);
-    if (!startIsoUtc) {
-      b.reprompts++;
-      const includeMenu = b.reprompts > MAX_REPROMPTS;
-      saySsml(vr, `<speak>Please say a day and time, like Friday at 9 a.m. or tomorrow at 2 p.m.</speak>`);
-      return endWithNextPrompt(res, vr, tenant.id, includeMenu);
+  if (b.stage === "need_name") {
+    const name = speech.trim().replace(/[^\p{L}\p{N}\s'\-]/gu, "").slice(0, 60);
+    if (!name || name.length < 2) {
+      sayText(vr, "Sorry, please say the name again.");
+      const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
+      gatherInput(vr, action, "Go ahead.", { bargeIn: true });
+      sayText(vr, "Goodbye.");
+      return hangup(res, vr);
     }
 
-    b.startIso = startIsoUtc;
-    b.stage = "need_name";
-    b.reprompts = 0;
+    b.customerName = name;
+    b.stage = "need_datetime";
 
-    saySsml(vr, `<speak>Perfect. What name should I put on the booking?</speak>`);
-    return endWithNextPrompt(res, vr, tenant.id);
+    saySsml(
+      vr,
+      `<speak>
+        Thanks, ${escapeForSsml(name)}.
+        <break time="150ms"/>
+        What day and time would you like?
+        <break time="150ms"/>
+        For example: Friday at 9 a.m.
+      </speak>`
+    );
+
+    const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
+    gatherInput(vr, action, "Go ahead.", { bargeIn: true });
+    sayText(vr, "Goodbye.");
+    return hangup(res, vr);
   }
 
-  // Stage: need name
-  if (session.booking.stage === "need_name") {
-    const nm = cleanNameFromSpeech(speech);
-    if (!nm || nm.length < 2) {
-      b.reprompts++;
-      const includeMenu = b.reprompts > MAX_REPROMPTS;
-      saySsml(vr, `<speak>Sorry, I didn’t catch the name. Please say the name again.</speak>`);
-      return endWithNextPrompt(res, vr, tenant.id, includeMenu);
+  if (b.stage === "need_datetime") {
+    const parsed = parseBookingDateTimeToUtcIso(speech, timeZone);
+    if (!parsed) {
+      saySsml(
+        vr,
+        `<speak>
+          Please say a day and time,
+          like Friday at 9 a.m. or tomorrow at 2 p.m.
+        </speak>`
+      );
+      const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
+      gatherInput(vr, action, "Go ahead.", { bargeIn: true });
+      sayText(vr, "Goodbye.");
+      return hangup(res, vr);
     }
 
-    b.name = nm;
+    const durationMin = b.durationMin ?? 30;
+    const startUtc = DateTime.fromISO(parsed.startIsoUtc, { zone: "utc" });
+    const endUtc = startUtc.plus({ minutes: durationMin });
+
+    b.startIsoUtc = startUtc.toISO()!;
+    b.endIsoUtc = endUtc.toISO()!;
+
+    // Calendar check (if configured)
+    if (calendarId) {
+      try {
+        const ok = await isSlotAvailable({
+          calendarId,
+          startIsoUtc: b.startIsoUtc,
+          endIsoUtc: b.endIsoUtc,
+          timeZone,
+        });
+
+        if (!ok) {
+          // find next available
+          const stepMin = kb.booking?.slotStepMin ?? 15;
+          const lookAheadDays = kb.booking?.lookAheadDays ?? 14;
+
+          const nextIso = await findNextAvailableSlot({
+            calendarId,
+            startIsoUtc: b.startIsoUtc,
+            durationMin,
+            timeZone,
+            lookAheadDays,
+            stepMin,
+          });
+
+          if (nextIso) {
+            const nextStart = DateTime.fromISO(nextIso, { zone: "utc" });
+            const nextEnd = nextStart.plus({ minutes: durationMin });
+
+            b.suggestedStartIsoUtc = nextStart.toISO()!;
+            b.suggestedEndIsoUtc = nextEnd.toISO()!;
+            b.stage = "suggest_alt";
+
+            saySsml(
+              vr,
+              `<speak>
+                That time is not available.
+                <break time="150ms"/>
+                The next available slot is
+                ${escapeForSsml(humanizeUtcIsoToLocal(b.suggestedStartIsoUtc, timeZone))}.
+                <break time="200ms"/>
+                Would you like to take that? Say yes or no.
+              </speak>`
+            );
+
+            const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
+            gatherInput(vr, action, "Go ahead.", { bargeIn: true });
+            sayText(vr, "Goodbye.");
+            return hangup(res, vr);
+          }
+
+          sayText(vr, "That time is not available, and I could not find another slot soon.");
+          sayText(vr, "Please suggest another day and time.");
+          const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
+          gatherInput(vr, action, "Go ahead.", { bargeIn: true });
+          sayText(vr, "Goodbye.");
+          return hangup(res, vr);
+        }
+      } catch (e) {
+        req.log.error({ e }, "Calendar availability check failed (continuing without blocking)");
+        // continue; don't block bookings if calendar has issues
+      }
+    }
+
     b.stage = "confirm";
-    b.reprompts = 0;
 
-    const whenHuman = b.startIso ? humanizeIsoInTz(b.startIso, tz) : "";
-    const priceHuman =
-      typeof b.priceZar === "number" ? moneyZarToSpeech(b.priceZar) : "price on request";
+    const whenLocal = humanizeUtcIsoToLocal(b.startIsoUtc, timeZone);
+    const priceLine =
+      typeof b.priceZar === "number" ? `Cost: ${zarToWords(b.priceZar)}.` : "";
 
+    // IMPORTANT: Only escape interpolated values, not SSML tags.
     saySsml(
       vr,
       `<speak>
         Just to confirm:
         <break time="150ms"/>
-        ${escapeForSsml(b.serviceName ?? "your service")},
-        for ${escapeForSsml(b.name)},
-        on ${escapeForSsml(whenHuman)}.
+        ${escapeForSsml(b.serviceName || "the service")},
+        for ${escapeForSsml(b.customerName || "")},
+        on ${escapeForSsml(whenLocal)}.
         <break time="150ms"/>
-        Cost: ${escapeForSsml(priceHuman)}.
+        ${escapeForSsml(priceLine)}
         <break time="200ms"/>
         Say <emphasis>yes</emphasis> to confirm, or <emphasis>no</emphasis> to change the time.
       </speak>`
     );
-    return endWithNextPrompt(res, vr, tenant.id);
+
+    const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
+    gatherInput(vr, action, "Go ahead.", { bargeIn: true, hints: ["yes", "no", "confirm", "change"] });
+    sayText(vr, "Goodbye.");
+    return hangup(res, vr);
   }
 
-  // Stage: confirm
-  if (session.booking.stage === "confirm") {
+  if (b.stage === "suggest_alt") {
     const t = normalizeText(speech);
     const yes = /\b(yes|yeah|yep|confirm|correct|okay|ok)\b/.test(t);
     const no = /\b(no|nope|cancel|not|change)\b/.test(t);
 
     if (no) {
       b.stage = "need_datetime";
-      b.reprompts = 0;
-      saySsml(vr, `<speak>No problem. What day and time would you prefer instead?</speak>`);
-      return endWithNextPrompt(res, vr, tenant.id);
+      sayText(vr, "No problem. Please tell me another day and time.");
+      const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
+      gatherInput(vr, action, "Go ahead.", { bargeIn: true });
+      sayText(vr, "Goodbye.");
+      return hangup(res, vr);
+    }
+
+    if (!yes || !b.suggestedStartIsoUtc || !b.suggestedEndIsoUtc) {
+      sayText(vr, "Please say yes to accept the next available slot, or no to choose a different time.");
+      const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
+      gatherInput(vr, action, "Go ahead.", { bargeIn: true });
+      sayText(vr, "Goodbye.");
+      return hangup(res, vr);
+    }
+
+    // Accept suggestion -> move into confirm using suggested
+    b.startIsoUtc = b.suggestedStartIsoUtc;
+    b.endIsoUtc = b.suggestedEndIsoUtc;
+    b.suggestedStartIsoUtc = undefined;
+    b.suggestedEndIsoUtc = undefined;
+    b.stage = "confirm";
+
+    const whenLocal = humanizeUtcIsoToLocal(b.startIsoUtc, timeZone);
+    saySsml(
+      vr,
+      `<speak>
+        Great.
+        <break time="150ms"/>
+        Confirm ${escapeForSsml(b.serviceName || "the service")} on ${escapeForSsml(whenLocal)}?
+        Say yes to confirm or no to change.
+      </speak>`
+    );
+
+    const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
+    gatherInput(vr, action, "Go ahead.", { bargeIn: true, hints: ["yes", "no"] });
+    sayText(vr, "Goodbye.");
+    return hangup(res, vr);
+  }
+
+  if (b.stage === "confirm") {
+    const t = normalizeText(speech);
+    const yes = /\b(yes|yeah|yep|confirm|correct|okay|ok)\b/.test(t);
+    const no = /\b(no|nope|cancel|not|change)\b/.test(t);
+
+    if (no) {
+      b.stage = "need_datetime";
+      sayText(vr, "No problem. What day and time would you prefer instead?");
+      const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
+      gatherInput(vr, action, "Go ahead.", { bargeIn: true });
+      sayText(vr, "Goodbye.");
+      return hangup(res, vr);
     }
 
     if (!yes) {
-      b.reprompts++;
-      const includeMenu = b.reprompts > MAX_REPROMPTS;
-      saySsml(vr, `<speak>Please say yes to confirm, or no to change the time.</speak>`);
-      return endWithNextPrompt(res, vr, tenant.id, includeMenu);
+      sayText(vr, "Please say yes to confirm, or no to change the time.");
+      const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
+      gatherInput(vr, action, "Go ahead.", { bargeIn: true, hints: ["yes", "no"] });
+      sayText(vr, "Goodbye.");
+      return hangup(res, vr);
     }
 
-    // Confirmed → calendar availability + event creation
-    const calendarId = tenant.calendarId || process.env.GOOGLE_CALENDAR_ID || "";
-    if (!calendarId) {
-      req.log.warn("GOOGLE_CALENDAR_ID missing; continuing without calendar");
-    }
+    // Confirmed: write Sheets + Calendar
+    b.stage = "done";
 
-    const startIso = b.startIso!;
     const durationMin = b.durationMin ?? 30;
-    const endIso = DateTime.fromISO(startIso, { zone: "utc" }).plus({ minutes: durationMin }).toISO()!;
 
-    // 1) Check availability (prevents double booking)
-    let available = true;
-    try {
-      if (calendarId) {
-        available = await isSlotAvailable({
-          calendarId,
-          startIsoUtc: startIso,
-          endIsoUtc: endIso,
-          timeZone: tz,
-        });
-      }
-    } catch (e) {
-      req.log.error({ e }, "Calendar availability check failed (treating as available)");
-      available = true; // fail-open; you can change to fail-closed if you prefer
-    }
-
-    if (!available) {
-      // Suggest next available slot
-      let suggestion: string | null = null;
-      try {
-        if (calendarId) {
-          const next = await findNextAvailableSlot({
-            calendarId,
-            startIsoUtc: startIso,
-            durationMin,
-            timeZone: tz,
-            lookAheadDays: 14,
-            stepMin: kb.booking?.slotSizeMin ?? 30,
-          });
-          if (next) suggestion = humanizeIsoInTz(next, tz);
-        }
-      } catch (e) {
-        req.log.error({ e }, "findNextAvailableSlot failed");
-      }
-
-      b.stage = "need_datetime";
-      b.reprompts = 0;
-
-      if (suggestion) {
-        saySsml(
-          vr,
-          `<speak>
-            Sorry, that time is no longer available.
-            <break time="150ms"/>
-            The next available time is ${escapeForSsml(suggestion)}.
-            <break time="200ms"/>
-            What day and time would you prefer?
-          </speak>`
-        );
-      } else {
-        saySsml(
-          vr,
-          `<speak>
-            Sorry, that time is no longer available.
-            <break time="150ms"/>
-            What day and time would you prefer instead?
-          </speak>`
-        );
-      }
-      return endWithNextPrompt(res, vr, tenant.id);
-    }
-
-    // 2) Create calendar event
-    try {
-      if (calendarId) {
-        await createBookingEvent({
-          calendarId,
-          tenantId: tenant.id,
-          callSid: session.callSid,
-          customerName: b.name || "",
-          customerPhone: session.from,
-          serviceName: b.serviceName || "",
-          startIsoUtc: startIso,
-          endIsoUtc: endIso,
-          timeZone: tz,
-          priceZar: b.priceZar,
-        });
-      }
-    } catch (e) {
-      req.log.error({ e }, "Calendar create event failed (continuing)");
-    }
-
-    // 3) Write booking row (Sheets)
+    // 1) Booking sheet
     try {
       await appendBookingLog({
         timestamp: new Date().toISOString(),
         tenantId: tenant.id,
         callSid: session.callSid,
-        name: b.name || "",
+        name: b.customerName || "",
         phone: session.from,
         service: b.serviceName || "",
-        startTime: startIso,
+        startTime: b.startIsoUtc || "",
         durationMin,
         status: "confirmed",
-        notes: `confirmed via voice${calendarId ? " + calendar" : ""}`,
+        notes: "confirmed via voice",
       });
     } catch (e) {
       req.log.error({ e }, "appendBookingLog failed");
     }
 
-    // 4) Call log row (Sheets)
+    // 2) Calendar event (only if configured)
+    if (calendarId && b.startIsoUtc && b.endIsoUtc) {
+      try {
+        await createBookingEvent({
+          calendarId,
+          tenantId: tenant.id,
+          callSid: session.callSid,
+          customerName: b.customerName || "",
+          customerPhone: session.from,
+          serviceName: b.serviceName || "Booking",
+          startIsoUtc: b.startIsoUtc,
+          endIsoUtc: b.endIsoUtc,
+          timeZone,
+          priceZar: b.priceZar,
+        });
+      } catch (e) {
+        req.log.error({ e }, "createBookingEvent failed");
+        // don’t fail the caller experience if calendar fails
+      }
+    }
+
+    // 3) Call log outcome
     appendCallLog({
       timestamp: new Date().toISOString(),
       tenantId: tenant.id,
       callSid: session.callSid,
       from: session.from,
       to: session.to,
-      speech: `BOOKING_CONFIRMED name=${b.name} service=${b.serviceId} start=${startIso}`,
-      confidence: undefined,
+      speech: `BOOKING_CONFIRMED service=${b.serviceId} start=${b.startIsoUtc}`,
+      confidence,
       outcome: "booking_confirmed",
     }).catch((e) => req.log.error({ e }, "appendCallLog failed"));
 
-    b.stage = "done";
-
-    const whenHuman = humanizeIsoInTz(startIso, tz);
+    // 4) Speak confirmation and END
+    const whenLocal = b.startIsoUtc ? humanizeUtcIsoToLocal(b.startIsoUtc, timeZone) : "that time";
     saySsml(
       vr,
       `<speak>
-        Perfect, ${escapeForSsml(b.name || "you're")} booked.
+        Perfect. You’re booked.
         <break time="150ms"/>
-        ${escapeForSsml(b.serviceName || "Your service")} on ${escapeForSsml(whenHuman)}.
+        ${escapeForSsml(b.serviceName || "Your booking")} for ${escapeForSsml(b.customerName || "")}
+        on ${escapeForSsml(whenLocal)}.
         <break time="200ms"/>
         Goodbye.
       </speak>`
     );
-    vr.hangup();
-    return res.type("text/xml").send(vr.toString());
+
+    return hangup(res, vr);
   }
 
-  // Safety fallback
-  session.booking = { stage: "need_service", reprompts: 0 };
-  saySsml(vr, `<speak>Sure. What would you like to book?</speak>`);
-  return endWithNextPrompt(res, vr, tenant.id);
+  // Fallback: reset
+  session.booking = { stage: "need_service", lowConfidenceCount: 0 };
+  sayText(vr, "Sure. What would you like to book?");
+  const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
+  gatherInput(vr, action, "Go ahead.", { bargeIn: true, hints: serviceHints });
+  sayText(vr, "Goodbye.");
+  return hangup(res, vr);
 }
 
 /** -------------------------
@@ -996,6 +1064,17 @@ app.get("/admin/calls.csv", (_req, res) => {
  *  ROUTES
  * ------------------------- */
 app.post("/webhooks/twilio/inbound-call", (req: Request<{}, {}, TwilioVoiceBody>, res: Response) => {
+  req.log.info(
+    {
+      computedUrl: getPublicUrl(req),
+      host: req.header("host"),
+      xfHost: req.header("x-forwarded-host"),
+      xfProto: req.header("x-forwarded-proto"),
+      hasSig: !!req.header("x-twilio-signature"),
+    },
+    "twilio inbound"
+  );
+
   if (!twilioSignatureOk(req)) return res.status(403).send("Invalid Twilio signature");
 
   const callSid = req.body.CallSid || "unknown";
@@ -1003,7 +1082,7 @@ app.post("/webhooks/twilio/inbound-call", (req: Request<{}, {}, TwilioVoiceBody>
   const to = req.body.To || req.body.Called || "unknown";
 
   const tenant = resolveTenantByTwilioNumber(to);
-  getSession(callSid, tenant, from, to);
+  const session = getSession(callSid, tenant, from, to);
 
   const vr = new twiml.VoiceResponse();
 
@@ -1013,29 +1092,32 @@ app.post("/webhooks/twilio/inbound-call", (req: Request<{}, {}, TwilioVoiceBody>
       vr,
       `<speak>
         Hi! You’ve reached ${escapeForSsml(tenant.businessName)}.
-        <break time="200ms"/>
+        <break time="250ms"/>
         We’re currently closed.
-        <break time="200ms"/>
-        You can still tell me what you need.
+        <break time="250ms"/>
+        Please tell me what you need, and I’ll take a message for the team.
       </speak>`
     );
   } else {
     saySsml(
       vr,
       `<speak>
-        Hi there. You’ve reached ${escapeForSsml(tenant.businessName)}.
-        <break time="150ms"/>
+        Hi there.
+        <break time="250ms"/>
+        You’ve reached ${escapeForSsml(tenant.businessName)}.
+        <break time="250ms"/>
+        I’m your virtual receptionist.
+        <break time="200ms"/>
         How can I help you today?
       </speak>`
     );
   }
 
   const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
-  gatherInput(vr, action, FOLLOWUP_PROMPT, { bargeIn: true });
+  gatherInput(vr, action, "Go ahead.", { bargeIn: true });
 
-  saySsml(vr, `<speak>Sorry, I didn’t catch that. Goodbye.</speak>`);
-  vr.hangup();
-  return res.type("text/xml").send(vr.toString());
+  sayText(vr, "Sorry, I didn’t catch that. Goodbye.");
+  return hangup(res, vr);
 });
 
 app.post("/webhooks/twilio/handle-speech", async (req: Request<{}, {}, TwilioVoiceBody>, res: Response) => {
@@ -1048,125 +1130,61 @@ app.post("/webhooks/twilio/handle-speech", async (req: Request<{}, {}, TwilioVoi
   const tenant = resolveTenantByTwilioNumber(to);
   const session = getSession(callSid, tenant, from, to);
 
+  const speech = (req.body.SpeechResult || "").trim();
+  const confidence = req.body.Confidence ? Number(req.body.Confidence) : undefined;
+
   session.turns++;
 
   const vr = new twiml.VoiceResponse();
 
   if (session.turns > MAX_TURNS) {
-    saySsml(vr, `<speak>Thanks for calling. Goodbye.</speak>`);
-    vr.hangup();
-    return res.type("text/xml").send(vr.toString());
+    sayText(vr, "Thanks for calling. Goodbye.");
+    return hangup(res, vr);
   }
 
-  // Load KB
+  if (!speech) {
+    sayText(vr, "I didn’t hear anything. Please repeat.");
+    const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
+    gatherInput(vr, action, "Go ahead.", { bargeIn: true });
+    sayText(vr, "Goodbye.");
+    return hangup(res, vr);
+  }
+
   let kb: KnowledgeBase;
   try {
     kb = loadKnowledgeBase(tenant.knowledgeBaseId);
   } catch (e: any) {
     req.log.error({ err: e, tenantId: tenant.id }, "KB load failed");
-    saySsml(vr, `<speak>Sorry, I’m having trouble accessing the business info right now.</speak>`);
+    sayText(vr, "Sorry, I’m having trouble accessing the business info right now.");
+
     const dialTo = tenant.handoffNumber;
     if (dialTo?.startsWith("+")) {
-      saySsml(vr, `<speak>Let me connect you to someone who can help.</speak>`);
+      sayText(vr, "Let me connect you to someone who can help.");
       vr.dial(dialTo);
       return res.type("text/xml").send(vr.toString());
     }
-    saySsml(vr, `<speak>Please try again later. Goodbye.</speak>`);
-    vr.hangup();
-    return res.type("text/xml").send(vr.toString());
+
+    sayText(vr, "Please try again later. Goodbye.");
+    return hangup(res, vr);
   }
 
-  const digits = (req.body.Digits || "").trim();
-  const speech = (req.body.SpeechResult || "").trim();
-  const confidence = req.body.Confidence ? Number(req.body.Confidence) : undefined;
-
-  const digitIntent = digitsToIntent(digits);
-
-  // If mid-booking: continue booking (DTMF doesn't carry booking info)
+  // Sticky booking: if mid-booking keep it regardless of intent
   if (session.booking.stage !== "idle" && session.booking.stage !== "done") {
-    if (!speech) {
-      session.booking.reprompts++;
-      const includeMenu = session.booking.reprompts > MAX_REPROMPTS;
-      saySsml(vr, `<speak>Sorry, I didn’t catch that. Please say it again.</speak>`);
-      return endWithNextPrompt(res, vr, tenant.id, includeMenu);
-    }
     return handleBookingTurn({ req, res, vr, tenant, kb, session, speech, confidence });
   }
 
-  // No input
-  if (!speech && !digitIntent) {
-    session.reprompts++;
-    const includeMenu = session.reprompts > MAX_REPROMPTS;
-    saySsml(vr, `<speak>Sorry, I didn’t catch that. Please say it again, or use the keypad.</speak>`);
-    return endWithNextPrompt(res, vr, tenant.id, includeMenu);
-  }
-
-  // Low confidence speech → reprompt + menu
-  if (speech && typeof confidence === "number" && confidence < MIN_CONFIDENCE) {
-    session.reprompts++;
-    const includeMenu = session.reprompts > MAX_REPROMPTS;
-    req.log.info({ confidence, speech }, "Low confidence speech");
-    saySsml(vr, `<speak>Sorry, I’m not sure I heard you correctly. Please say that again, or use the keypad.</speak>`);
-    return endWithNextPrompt(res, vr, tenant.id, includeMenu);
-  }
-
-  const intent: Intent = digitIntent ?? detectIntent(speech);
+  const intent = detectIntent(speech);
 
   // Start booking
   if (intent === "BOOKING") {
-    session.booking = { stage: "need_service", reprompts: 0 };
-    // If they said “book haircut tomorrow 2pm”, we can try to extract service quickly
+    session.booking = { stage: "need_service", lowConfidenceCount: 0 };
     return handleBookingTurn({ req, res, vr, tenant, kb, session, speech, confidence });
   }
 
-  // Handoff
-  if (intent === "HANDOFF") {
-    const dialTo = tenant.handoffNumber || kb.handoffNumber;
-    if (dialTo?.startsWith("+")) {
-      saySsml(vr, `<speak>Okay. Connecting you now.</speak>`);
-      vr.dial(dialTo);
-      return res.type("text/xml").send(vr.toString());
-    }
-    saySsml(vr, `<speak>I can’t transfer right now. Please leave your number and we’ll call you back. Goodbye.</speak>`);
-    vr.hangup();
-    return res.type("text/xml").send(vr.toString());
-  }
+  const handoffRegex =
+    /\b(owner|manager|human|agent|representative|operator)\b|speak to (the )?(owner|manager|someone)/i;
+  const handoffRegexHit = handoffRegex.test(speech);
 
-  // Non-booking answers
-  let answered = false;
-
-  if (intent === "PRICING") {
-    saySsml(vr, formatPricesSsml(kb.services));
-    answered = true;
-  } else if (intent === "HOURS") {
-    // Improve later: format from KB hours if you store it
-    saySsml(vr, `<speak>We are open Monday to Friday, nine to six. Saturday, nine to three. Closed Sundays.</speak>`);
-    answered = true;
-  } else if (intent === "ADDRESS") {
-    const addr = kb.address ? escapeForSsml(kb.address) : "I can share the address once it’s provided.";
-    saySsml(vr, `<speak>${addr}</speak>`);
-    answered = true;
-  } else if (intent === "POLICY") {
-    const policy = kb.policies ? Object.values(kb.policies)[0] : null;
-    const ans = policy || bestFaqAnswer(kb, speech);
-    if (ans) {
-      saySsml(vr, `<speak>${escapeForSsml(ans)}</speak>`);
-      answered = true;
-    }
-  } else {
-    const ans = bestFaqAnswer(kb, speech);
-    if (ans) {
-      saySsml(vr, `<speak>${escapeForSsml(ans)}</speak>`);
-      answered = true;
-    }
-  }
-
-  if (!answered) {
-    saySsml(vr, `<speak>I can help with bookings, prices, hours, and location. What would you like?</speak>`);
-  }
-
-  // Logs
-  const handoffRegexHit = /\b(owner|manager|human|agent|representative|operator)\b/i.test(speech);
   logCallTurn({
     tenantId: tenant.id,
     callSid,
@@ -1175,21 +1193,73 @@ app.post("/webhooks/twilio/handle-speech", async (req: Request<{}, {}, TwilioVoi
     intent,
     confidence,
     handoff: handoffRegexHit,
-    transcript: speech || `DTMF:${digits}`,
+    transcript: speech,
   });
 
+  // Handoff
+  if (intent === "HANDOFF") {
+    saySsml(
+      vr,
+      `<speak>
+        Okay.
+        <break time="150ms"/>
+        Let me connect you to the owner.
+      </speak>`
+    );
+
+    const dialTo = tenant.handoffNumber || kb.handoffNumber;
+    if (!dialTo || !dialTo.startsWith("+")) {
+      sayText(vr, "I can’t transfer right now. Please leave your number and we’ll call you back. Goodbye.");
+      return hangup(res, vr);
+    }
+
+    vr.dial(dialTo);
+    return res.type("text/xml").send(vr.toString());
+  }
+
+  // Answer
+  let answer: string | null = null;
+  if (intent === "PRICING") answer = formatPricesSpeechFriendly(kb.services);
+  else if (intent === "HOURS") answer = "Please ask the business to provide hours in the knowledge base."; // keep honest
+  else if (intent === "ADDRESS") answer = kb.address || "I can share the address once it’s provided.";
+  else if (intent === "POLICY") {
+    const policy = kb.policies ? Object.values(kb.policies)[0] : null;
+    answer = policy || bestFaqAnswer(kb, speech);
+  } else {
+    answer = bestFaqAnswer(kb, speech);
+  }
+
+  if (answer) {
+    sayText(vr, answer);
+  } else {
+    saySsml(
+      vr,
+      `<speak>
+        I can help with prices, business hours, location, and bookings.
+        <break time="200ms"/>
+        What would you like to know?
+      </speak>`
+    );
+  }
+
+  // Google Sheet call log
+  const outcome = handoffRegexHit ? "handoff" : answer ? "answered" : "fallback";
   appendCallLog({
     timestamp: new Date().toISOString(),
     tenantId: tenant.id,
     callSid,
-    from: session.from,
-    to: session.to,
-    speech: speech || `DTMF:${digits}`,
+    from: req.body.From || "",
+    to: (req.body.To || req.body.Called || "").toString(),
+    speech,
     confidence,
-    outcome: answered ? "answered" : "fallback",
+    outcome,
   }).catch((e) => req.log.error({ e }, "Failed to append call log to Google Sheets"));
 
-  return endWithNextPrompt(res, vr, tenant.id, session.reprompts > MAX_REPROMPTS);
+  const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
+  gatherInput(vr, action, "Go ahead.", { bargeIn: true });
+
+  sayText(vr, "Goodbye.");
+  return hangup(res, vr);
 });
 
 /** -------------------------
@@ -1208,7 +1278,7 @@ app.listen(PORT, () => {
 });
 
 /** -------------------------
- *  SSML escaping
+ *  SSML ESCAPE
  * ------------------------- */
 function escapeForSsml(s: string) {
   return (s || "")
