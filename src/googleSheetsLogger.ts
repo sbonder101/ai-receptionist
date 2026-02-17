@@ -158,38 +158,26 @@ export async function appendBookingLog(row: BookingRow) {
   const sheets = google.sheets({ version: "v4", auth });
 
   const headers = [
-    "timestamp",
-    "tenantId",
-    "callSid",
-    "name",
-    "phone",
-    "service",
-    "startTime",
-    "durationMin",
-    "status",
-    "notes",
+    "timestamp","tenantId","callSid","name","phone",
+    "service","startTime","durationMin","status","notes",
   ];
 
-//   await ensureHeaderRow(sheets, spreadsheetId, tabName, headers);
+  await withRetry(() =>
+    ensureHeaderRow(sheets, spreadsheetId, tabName, headers, "A1:J1")
+  );
 
-  await sheets.spreadsheets.values.append({
-    spreadsheetId,
-    range: `${tabName}!A:J`,
-    valueInputOption: "USER_ENTERED",
-    insertDataOption: "INSERT_ROWS",
-    requestBody: {
-      values: [[
-        row.timestamp,
-        row.tenantId,
-        row.callSid,
-        row.name,
-        row.phone,
-        row.service,
-        row.startTime,
-        row.durationMin,
-        row.status,
-        row.notes,
-      ]],
-    },
-  });
+  await withRetry(() =>
+    sheets.spreadsheets.values.append({
+      spreadsheetId,
+      range: tabRange(tabName, "A:J"),
+      valueInputOption: "USER_ENTERED",
+      insertDataOption: "INSERT_ROWS",
+      requestBody: {
+        values: [[
+          row.timestamp, row.tenantId, row.callSid, row.name, row.phone,
+          row.service, row.startTime, row.durationMin, row.status, row.notes,
+        ]],
+      },
+    })
+  );
 }
