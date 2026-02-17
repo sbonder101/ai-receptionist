@@ -158,12 +158,26 @@ export async function appendBookingLog(row: BookingRow) {
   const sheets = google.sheets({ version: "v4", auth });
 
   const headers = [
-    "timestamp","tenantId","callSid","name","phone",
-    "service","startTime","durationMin","status","notes",
+    "Timestamp",
+    "Tenant",
+    "CallSid",
+    "Name",
+    "Phone",
+    "Service",
+    "StartTime",
+    "DurationMin",
+    "Status",
+    "Notes",
   ];
 
   await withRetry(() =>
-    ensureHeaderRow(sheets, spreadsheetId, tabName, headers, "A1:J1")
+    ensureHeaderRow(
+      sheets,
+      spreadsheetId,
+      tabName,
+      headers,
+      "A1:J1"
+    )
   );
 
   await withRetry(() =>
@@ -174,10 +188,19 @@ export async function appendBookingLog(row: BookingRow) {
       insertDataOption: "INSERT_ROWS",
       requestBody: {
         values: [[
-          row.timestamp, row.tenantId, row.callSid, row.name, row.phone,
-          row.service, row.startTime, row.durationMin, row.status, row.notes,
+          row.timestamp,
+          row.tenantId,
+          row.callSid,
+          row.name,
+          row.phone,
+          row.service,
+          row.startTime,
+          row.durationMin,
+          row.status,
+          row.notes,
         ]],
       },
     })
   );
 }
+
