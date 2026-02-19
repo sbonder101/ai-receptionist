@@ -541,6 +541,64 @@ function normalizeText(s: string) {
   return (s || "").toLowerCase().replace(/\s+/g, " ").trim();
 }
 
+/**
+ * Extract a likely caller name from free-form speech.
+ * Conservative: avoids capturing service/time words.
+ */
+function extractCallerName(speech: string): string | null {
+  const raw = (speech || "").trim();
+  if (!raw) return null;
+
+  const t = raw.replace(/\s+/g, " ").trim();
+  const lower = t.toLowerCase();
+
+  const patterns: RegExp[] = [
+    /\bmy name is\s+([a-z][a-z\-']{1,30})(?:\b|$)/i,
+    /\bi am\s+([a-z][a-z\-']{1,30})(?:\b|$)/i,
+    /\bthis is\s+([a-z][a-z\-']{1,30})(?:\b|$)/i,
+    /\bit'?s\s+([a-z][a-z\-']{1,30})(?:\b|$)/i,
+  ];
+  for (const p of patterns) {
+    const m = t.match(p);
+    if (m?.[1]) return capitalizeName(m[1]);
+  }
+
+  const tokens = lower.split(/\s+/).filter(Boolean);
+  if (tokens.length === 1 && /^[a-z][a-z\-']{1,30}$/i.test(tokens[0])) {
+    const bad = new Set([
+      "haircut",
+      "cut",
+      "fade",
+      "trim",
+      "beard",
+      "booking",
+      "appointment",
+      "tomorrow",
+      "today",
+      "monday",
+      "tuesday",
+      "wednesday",
+      "thursday",
+      "friday",
+      "saturday",
+      "sunday",
+      "yes",
+      "no",
+      "okay",
+      "ok",
+    ]);
+    if (!bad.has(tokens[0])) return capitalizeName(tokens[0]);
+  }
+
+  return null;
+}
+
+function capitalizeName(name: string): string {
+  const n = (name || "").trim();
+  if (!n) return "";
+  return n.charAt(0).toUpperCase() + n.slice(1).toLowerCase();
+}
+
 function findService(kb: KnowledgeBase, speech: string): KBService | null {
   const t = normalizeText(speech);
   const services = kb.services || [];
@@ -626,6 +684,15 @@ function parseBookingDateTimeIso(speech: string, tz: string): string | null {
 function humanizeIsoInTz(isoUtc: string, tz: string) {
   const dt = DateTime.fromISO(isoUtc, { zone: "utc" }).setZone(tz);
   return dt.toLocaleString(DateTime.DATETIME_FULL);
+}
+
+function sayBookingConfirmPrompt(vr: twiml.VoiceResponse, b: BookingState, tz: string) {
+  const whenHuman = b.startIso ? humanizeIsoInTz(b.startIso, tz) : "";
+  const pricePart = typeof b.servicePriceZar === "number" ? ` Cost: ${zarToWords(b.servicePriceZar)}.` : "";
+  sayText(
+    vr,
+    `Just to confirm: ${b.serviceName || "your service"} for ${b.callerName || "you"}, on ${whenHuman}.${pricePart} Say yes to confirm, or no to change.`
+  );
 }
 
 function getHintsForBookingStage(kb: KnowledgeBase, stage: BookingStage): string[] {
@@ -752,6 +819,7 @@ async function handleBookingTurn(args: {
 
   const tz = kb.timezone || tenant.timezone || "Africa/Johannesburg";
   const b = session.booking;
+  const stageBeforePrefill = b.stage;
 
   // Low-confidence handling (don't advance state)
   if (confidenceTooLow(confidence)) {
@@ -772,6 +840,39 @@ async function handleBookingTurn(args: {
     return res.type("text/xml").send(vr.toString());
   } else {
     b.lowConfidenceCount = 0;
+  }
+
+  // Prefill missing booking fields from ANY utterance.
+  // Enables one-shot requests like:
+  // "I want to book a haircut tomorrow at 3pm, my name is Bonito".
+  if (!b.serviceId || !b.serviceName) {
+    const svc0 = findService(kb, speech);
+    if (svc0) {
+      b.serviceId = svc0.id;
+      b.serviceName = svc0.name;
+      b.serviceDurationMin = svc0.durationMin;
+      b.servicePriceZar = svc0.priceZar;
+    }
+  }
+  if (!b.callerName) {
+    const n0 = extractCallerName(speech) || extractNameFromSpeech(speech);
+    if (n0) b.callerName = n0;
+  }
+  if (!b.startIso) {
+    const iso0 = parseBookingDateTimeIso(speech, tz);
+    if (iso0) b.startIso = iso0;
+  }
+
+  // If everything is present, jump straight to confirm.
+  if (b.stage !== "confirm" && b.serviceId && b.serviceName && b.callerName && b.startIso) {
+    b.stage = "confirm";
+  }
+
+  // If we just transitioned into confirm, we must prompt the confirmation question now.
+  // Otherwise this same utterance will be treated as the yes/no answer.
+  if (stageBeforePrefill !== "confirm" && b.stage === "confirm") {
+    sayBookingConfirmPrompt(vr, b, tz);
+    return promptNext(res, vr, tenant.id, getHintsForBookingStage(kb, "confirm"));
   }
 
   // If idle, try to auto-detect service and datetime from first utterance
@@ -810,6 +911,14 @@ async function handleBookingTurn(args: {
     b.serviceName = svc.name;
     b.serviceDurationMin = svc.durationMin;
     b.servicePriceZar = svc.priceZar;
+
+    // If name + time were already captured earlier, jump straight to confirm.
+    if (b.callerName && b.startIso) {
+      b.stage = "confirm";
+      sayBookingConfirmPrompt(vr, b, tz);
+      return promptNext(res, vr, tenant.id, getHintsForBookingStage(kb, "confirm"));
+    }
+
     b.stage = "need_name";
 
     const pricePart = typeof svc.priceZar === "number" ? ` It costs ${zarToWords(svc.priceZar)}.` : "";
@@ -818,7 +927,7 @@ async function handleBookingTurn(args: {
   }
 
   if (b.stage === "need_name") {
-    const name = extractNameFromSpeech(speech);
+    const name = b.callerName || extractCallerName(speech) || extractNameFromSpeech(speech);
     if (!name) {
       sayText(vr, "Sorry, what is your name for the booking?");
       return promptNext(res, vr, tenant.id, getHintsForBookingStage(kb, "need_name"));
@@ -880,12 +989,19 @@ async function handleBookingTurn(args: {
       return promptNext(res, vr, tenant.id, getHintsForBookingStage(kb, "need_datetime"));
     }
 
-    const validation = await validateAndMaybeSuggest({
-      tenant,
-      kb,
-      serviceDurationMin: duration,
-      startIsoUtc,
-    });
+    let validation: Awaited<ReturnType<typeof validateAndMaybeSuggest>>;
+    try {
+      validation = await validateAndMaybeSuggest({
+        tenant,
+        kb,
+        serviceDurationMin: duration,
+        startIsoUtc,
+      });
+    } catch (e: any) {
+      // Never break the call flow if Calendar API has a transient failure.
+      req.log.error({ err: e }, "validateAndMaybeSuggest failed");
+      validation = { ok: true };
+    }
 
     if (!validation.ok) {
       if (validation.suggestionIsoUtc) {
