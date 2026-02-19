@@ -995,6 +995,7 @@ app.get("/admin/calls.csv", (_req, res) => {
 
 /** Inbound call webhook */
 app.post("/webhooks/twilio/inbound-call", (req: Request<{}, {}, TwilioVoiceBody>, res: Response) => {
+  try {
   req.log.info(
     {
       computedUrl: getPublicUrl(req),
@@ -1029,6 +1030,13 @@ app.post("/webhooks/twilio/inbound-call", (req: Request<{}, {}, TwilioVoiceBody>
   addNoInputRedirect(vr, tenant.id, 1);
 
   return res.type("text/xml").send(vr.toString());
+  } catch (err: any) {
+    req.log.error({ err }, "inbound-call failed");
+    const vr = new twiml.VoiceResponse();
+    sayText(vr, "Sorry, something went wrong. Please try again later.");
+    vr.hangup();
+    return res.type("text/xml").send(vr.toString());
+  }
 });
 
 /** No-input fallback (after Gather timeout) */
@@ -1054,6 +1062,7 @@ app.post("/webhooks/twilio/no-input", (req: Request, res: Response) => {
 
 /** Handle speech webhook */
 app.post("/webhooks/twilio/handle-speech", async (req: Request<{}, {}, TwilioVoiceBody>, res: Response) => {
+  try {
   if (!twilioSignatureOk(req)) return res.status(403).send("Invalid Twilio signature");
 
   const callSid = req.body.CallSid || "unknown";
@@ -1176,6 +1185,14 @@ app.post("/webhooks/twilio/handle-speech", async (req: Request<{}, {}, TwilioVoi
   }
 
   return promptNext(res, vr, tenant.id, ["book", "price", "hours", "address"]);
+  } catch (err: any) {
+    // IMPORTANT: Always respond with TwiML to Twilio (not JSON) to prevent retries/fallback errors.
+    req.log.error({ err }, "handle-speech failed");
+    const vr = new twiml.VoiceResponse();
+    sayText(vr, "Sorry, I had a technical problem. Please try again.");
+    vr.hangup();
+    return res.type("text/xml").send(vr.toString());
+  }
 });
 
 /** -------------------------
