@@ -175,6 +175,7 @@ type CallSession = {
   createdAt: number;
   turns: number;
   booking: BookingState;
+  noInputCount?: number;
 };
 
 /** -------------------------
@@ -683,7 +684,8 @@ function parseBookingDateTimeIso(speech: string, tz: string): string | null {
 
 function humanizeIsoInTz(isoUtc: string, tz: string) {
   const dt = DateTime.fromISO(isoUtc, { zone: "utc" }).setZone(tz);
-  return dt.toLocaleString(DateTime.DATETIME_FULL);
+  // Example: "Friday, 19 February at 3:00 PM"
+  return dt.toFormat("cccc, d LLLL 'at' h:mm a");
 }
 
 function sayBookingConfirmPrompt(vr: twiml.VoiceResponse, b: BookingState, tz: string) {
@@ -696,19 +698,18 @@ function sayBookingConfirmPrompt(vr: twiml.VoiceResponse, b: BookingState, tz: s
 }
 
 function getHintsForBookingStage(kb: KnowledgeBase, stage: BookingStage): string[] {
+  const services = kb.services || [];
+  const serviceNames = services.map(s => s.name).filter(Boolean) as string[];
+  const serviceKeywords = services
+    .flatMap(s => Array.isArray(s.keywords) ? s.keywords : [])
+    .filter(Boolean) as string[];
+
   if (stage === "need_service") {
-    const services = (kb.services || []).slice(0, 12).map((s) => s.name);
-    return ["haircut", "appointment", ...services].filter(Boolean);
+    return ["book", "appointment", ...serviceNames, ...serviceKeywords].slice(0, 20);
   }
-  if (stage === "need_name") {
-    return ["my name is", "it's", "I am"];
-  }
-  if (stage === "need_datetime") {
-    return ["today", "tomorrow", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "9 am", "2 pm", "14:00"];
-  }
-  if (stage === "confirm") {
-    return ["yes", "no", "confirm", "change"];
-  }
+  if (stage === "need_name") return ["my name is", "it's", "i am"];
+  if (stage === "need_datetime") return ["today", "tomorrow", "monday", "9 am", "2 pm", "14:00"];
+  if (stage === "confirm") return ["yes", "no", "confirm", "change"];
   return [];
 }
 
@@ -829,15 +830,13 @@ async function handleBookingTurn(args: {
       sayText(vr, "Sorry, the line is not very clear. You can also say it slowly, or I can connect you to the owner.");
       const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
       gatherInput(vr, action, "Please repeat that slowly.", { hints: getHintsForBookingStage(kb, b.stage) });
-      addNoInputRedirect(vr, tenant.id, 1);
-      return res.type("text/xml").send(vr.toString());
+return res.type("text/xml").send(vr.toString());
     }
 
     sayText(vr, "Sorry, I didn’t catch that clearly. Please repeat.");
     const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
     gatherInput(vr, action, "Please repeat.", { hints: getHintsForBookingStage(kb, b.stage) });
-    addNoInputRedirect(vr, tenant.id, 1);
-    return res.type("text/xml").send(vr.toString());
+return res.type("text/xml").send(vr.toString());
   } else {
     b.lowConfidenceCount = 0;
   }
@@ -1031,9 +1030,27 @@ async function handleBookingTurn(args: {
     ].filter(Boolean).join("\n");
 
     try {
+      req.log.info(
+        {
+          calendarIdFromEnv: process.env.GOOGLE_CALENDAR_ID,
+          calendarIdFromTenant: tenant.calendarId,
+          calendarIdFromKb: kb?.calendarId,
+          calendarIdUsed: calendarId, // whatever variable you pass to createBookingEvent
+        },
+        "Calendar IDs (debug)"
+      );
+      
       await createBookingEvent(title, description, startIsoUtc, endIsoUtc, tenant.calendarId);
     } catch (e: any) {
-      req.log.error({ e }, "createBookingEvent failed");
+      req.log.error(
+  {
+    message: e?.message,
+    status: e?.code,
+    data: e?.response?.data,
+    errors: e?.response?.data?.error,
+  },
+  "createBookingEvent failed"
+);
       // We still log the booking to Sheets as "pending_calendar"
     }
 
@@ -1084,8 +1101,7 @@ async function handleBookingTurn(args: {
 function promptNext(res: Response, vr: twiml.VoiceResponse, tenantId: string, hints: string[] = []) {
   const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId });
   gatherInput(vr, action, "Go ahead.", { bargeIn: true, hints });
-  addNoInputRedirect(vr, tenantId, 1);
-  return res.type("text/xml").send(vr.toString());
+return res.type("text/xml").send(vr.toString());
 }
 
 function sendAndEnd(res: Response, vr: twiml.VoiceResponse) {
@@ -1143,9 +1159,7 @@ app.post("/webhooks/twilio/inbound-call", (req: Request<{}, {}, TwilioVoiceBody>
 
   const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
   gatherInput(vr, action, "Go ahead.", { bargeIn: true, hints: ["book", "price", "hours", "address", "appointment"] });
-  addNoInputRedirect(vr, tenant.id, 1);
-
-  return res.type("text/xml").send(vr.toString());
+return res.type("text/xml").send(vr.toString());
   } catch (err: any) {
     req.log.error({ err }, "inbound-call failed");
     const vr = new twiml.VoiceResponse();
@@ -1168,8 +1182,7 @@ app.post("/webhooks/twilio/no-input", (req: Request, res: Response) => {
     sayText(vr, "Sorry, I didn’t catch that.");
     const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId });
     gatherInput(vr, action, "Please say that again.", { bargeIn: true });
-    addNoInputRedirect(vr, tenantId, 2);
-    return res.type("text/xml").send(vr.toString());
+return res.type("text/xml").send(vr.toString());
   }
 
   sayText(vr, "No problem. Please call again when you’re ready. Goodbye.");
@@ -1199,10 +1212,20 @@ app.post("/webhooks/twilio/handle-speech", async (req: Request<{}, {}, TwilioVoi
   // Convert DTMF digits to an utterance if no speech (backup)
   const utterance = speech || digits;
 
+  session.noInputCount = (session.noInputCount ?? 0) + 1;
+
   if (!utterance) {
-    sayText(vr, "I didn’t hear anything. Please call again. Goodbye.");
+    if (session.noInputCount <= 1) {
+      sayText(vr, "Sorry, I didn’t catch that. Please say it again.");
+      const action = buildAbsoluteUrl("/webhooks/twilio/handle-speech", { tenantId: tenant.id });
+      // gatherInput(vr, action, "Go ahead.", { bargeIn: true, hints: getHintsForBookingStage(kb, session.booking.stage) });
+      gatherInput(vr, action, "Go ahead.", { bargeIn: true, hints: ["yes", "no", "repeat", "book", "appointment", "today", "tomorrow"] });
+      return res.type("text/xml").send(vr.toString());
+    }
+    sayText(vr, "No problem. Please call again when you’re ready. Goodbye.");
     return sendAndEnd(res, vr);
   }
+
 
   // Load KB safely
   let kb: KnowledgeBase;
