@@ -38,6 +38,7 @@ export async function createBookingEvent(
   const calendar = google.calendar({ version: "v3", auth });
 
   const calendarId = resolveCalendarId(calendarIdOverride);
+  
 
   const res = await calendar.events.insert({
     calendarId,

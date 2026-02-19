@@ -1030,16 +1030,6 @@ return res.type("text/xml").send(vr.toString());
     ].filter(Boolean).join("\n");
 
     try {
-      req.log.info(
-        {
-          calendarIdFromEnv: process.env.GOOGLE_CALENDAR_ID,
-          calendarIdFromTenant: tenant.calendarId,
-          calendarIdFromKb: kb?.calendarId,
-          calendarIdUsed: calendarId, // whatever variable you pass to createBookingEvent
-        },
-        "Calendar IDs (debug)"
-      );
-      
       await createBookingEvent(title, description, startIsoUtc, endIsoUtc, tenant.calendarId);
     } catch (e: any) {
       req.log.error(
