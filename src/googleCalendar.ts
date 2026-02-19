@@ -15,114 +15,91 @@ function getAuth() {
   return new google.auth.JWT({
     email: clientEmail,
     key: privateKey,
-    scopes: [
-      "https://www.googleapis.com/auth/calendar",
-      "https://www.googleapis.com/auth/calendar.events",
-    ],
+    scopes: ["https://www.googleapis.com/auth/calendar"],
   });
 }
 
-function calendarClient() {
-  const auth = getAuth();
-  return google.calendar({ version: "v3", auth });
-}
-
-export async function isSlotAvailable(args: {
-  calendarId: string;
-  startIsoUtc: string;
-  endIsoUtc: string;
-  timeZone: string;
-}): Promise<boolean> {
-  const cal = calendarClient();
-
-  const resp = await cal.freebusy.query({
-    requestBody: {
-      timeMin: args.startIsoUtc,
-      timeMax: args.endIsoUtc,
-      timeZone: args.timeZone,
-      items: [{ id: args.calendarId }],
-    },
-  });
-
-  const busy = resp.data.calendars?.[args.calendarId]?.busy || [];
-  return busy.length === 0;
-}
-
-export async function createBookingEvent(args: {
-  calendarId: string;
-  tenantId: string;
-  callSid: string;
-  customerName: string;
-  customerPhone: string;
-  serviceName: string;
-  startIsoUtc: string;
-  endIsoUtc: string;
-  timeZone: string;
-  priceZar?: number;
-}) {
-  const cal = calendarClient();
-
-  const priceLine =
-    typeof args.priceZar === "number" ? `Price: ZAR ${args.priceZar}` : "Price: on request";
-
-  const summary = `${args.serviceName} — ${args.customerName || args.customerPhone}`;
-  const description = [
-    `Tenant: ${args.tenantId}`,
-    `CallSid: ${args.callSid}`,
-    `Customer: ${args.customerName}`,
-    `Phone: ${args.customerPhone}`,
-    `Service: ${args.serviceName}`,
-    priceLine,
-  ]
-    .filter(Boolean)
-    .join("\n");
-
-  await cal.events.insert({
-    calendarId: args.calendarId,
-    requestBody: {
-      summary,
-      description,
-      start: { dateTime: args.startIsoUtc, timeZone: "UTC" },
-      end: { dateTime: args.endIsoUtc, timeZone: "UTC" },
-      extendedProperties: {
-        private: {
-          tenantId: args.tenantId,
-          callSid: args.callSid,
-          phone: args.customerPhone,
-        },
-      },
-    },
-  });
+function resolveCalendarId(override?: string) {
+  return override || process.env.GOOGLE_CALENDAR_ID || requiredEnv("GOOGLE_CALENDAR_ID");
 }
 
 /**
- * Find next available slot after a starting point.
- * - looks ahead a limited number of days
- * - steps forward in increments (slotSize)
+ * Create booking event on Google Calendar.
+ * IMPORTANT: Share the target calendar with the service account (GOOGLE_CLIENT_EMAIL).
  */
-export async function findNextAvailableSlot(args: {
-  calendarId: string;
-  startIsoUtc: string;
-  durationMin: number;
-  timeZone: string;
-  lookAheadDays: number;
-  stepMin: number;
-}): Promise<string | null> {
-  const start = DateTime.fromISO(args.startIsoUtc, { zone: "utc" });
-  const endLimit = start.plus({ days: args.lookAheadDays });
+export async function createBookingEvent(
+  title: string,
+  description: string,
+  startIsoUtc: string,
+  endIsoUtc: string,
+  calendarIdOverride?: string
+) {
+  const auth = getAuth();
+  const calendar = google.calendar({ version: "v3", auth });
 
-  let cursor = start;
+  const calendarId = resolveCalendarId(calendarIdOverride);
 
-  while (cursor < endLimit) {
-    const end = cursor.plus({ minutes: args.durationMin });
-    const ok = await isSlotAvailable({
-      calendarId: args.calendarId,
-      startIsoUtc: cursor.toISO()!,
-      endIsoUtc: end.toISO()!,
-      timeZone: args.timeZone,
-    });
-    if (ok) return cursor.toISO()!;
-    cursor = cursor.plus({ minutes: args.stepMin });
+  const res = await calendar.events.insert({
+    calendarId,
+    requestBody: {
+      summary: title,
+      description,
+      start: { dateTime: startIsoUtc, timeZone: "UTC" },
+      end: { dateTime: endIsoUtc, timeZone: "UTC" },
+    },
+  });
+
+  return res.data;
+}
+
+/**
+ * Check if a given time slot is available (no conflicts) using FreeBusy.
+ * Returns true if free.
+ */
+export async function isSlotAvailable(
+  startIsoUtc: string,
+  endIsoUtc: string,
+  calendarIdOverride?: string
+): Promise<boolean> {
+  const auth = getAuth();
+  const calendar = google.calendar({ version: "v3", auth });
+
+  const calendarId = resolveCalendarId(calendarIdOverride);
+
+  const res = await calendar.freebusy.query({
+    requestBody: {
+      timeMin: startIsoUtc,
+      timeMax: endIsoUtc,
+      items: [{ id: calendarId }],
+    },
+  });
+
+  const busy = res.data.calendars?.[calendarId]?.busy || [];
+  return busy.length === 0;
+}
+
+/**
+ * Find next available slot starting at `startIsoUtc` by stepping forward in `stepMinutes`.
+ * Returns ISO UTC of suggested start, or null if none found in the search window.
+ */
+export async function findNextAvailableSlot(
+  startIsoUtc: string,
+  durationMin: number,
+  calendarIdOverride?: string,
+  opts?: { daysToSearch?: number; stepMinutes?: number }
+): Promise<string | null> {
+  const daysToSearch = opts?.daysToSearch ?? 7;
+  const stepMinutes = opts?.stepMinutes ?? 30;
+
+  let cursor = DateTime.fromISO(startIsoUtc, { zone: "utc" });
+  const endSearch = cursor.plus({ days: daysToSearch });
+
+  while (cursor < endSearch) {
+    const start = cursor.toUTC().toISO()!;
+    const end = cursor.plus({ minutes: durationMin }).toUTC().toISO()!;
+    const ok = await isSlotAvailable(start, end, calendarIdOverride);
+    if (ok) return start;
+    cursor = cursor.plus({ minutes: stepMinutes });
   }
 
   return null;
